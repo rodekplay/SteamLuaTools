@@ -358,17 +358,14 @@
             });
 
             try {
-                // Загружаем tokenstest.json
-                let token = null;
-                let tokensData = null;
-                
+                // Ищем токен
                 const tokensResponse = await fetch('tokenstest.json');
                 if (!tokensResponse.ok) {
                     throw new Error('Не удалось загрузить tokenstest.json');
                 }
                 const tokensText = await tokensResponse.text();
-                tokensData = JSON.parse(tokensText);
-                token = tokensData[gameId];
+                const tokensData = JSON.parse(tokensText);
+                const token = tokensData[gameId];
 
                 if (!token) {
                     const notFoundMsg = `❌ Манифест для AppID ${gameId} не найден.\nПопробуйте другой ID.`;
@@ -381,7 +378,7 @@
                     return;
                 }
 
-                // Загружаем depotkeys.json
+                // Ищем депоты
                 let depotKeys = {};
                 try {
                     const depotResponse = await fetch('depotkeys.json');
@@ -400,33 +397,29 @@
 
                 terminalOutput.textContent += `📦 Создание ZIP архива...\n`;
 
-                // Создаем ZIP архив
+                // Создаем ZIP с файлами прямо в корне
                 const zip = new JSZip();
                 
-                // Создаем папку с AppID
-                const folder = zip.folder(gameId);
+                // Создаем .manifest файл (просто токен)
+                zip.file(`${gameId}.manifest`, token);
                 
-                // Добавляем token.json
-                folder.file('token.json', JSON.stringify({ appId: gameId, token: token }, null, 2));
-                
-                // Добавляем depotkeys.json
-                if (Object.keys(depotKeys).length > 0) {
-                    folder.file('depotkeys.json', JSON.stringify(depotKeys, null, 2));
-                }
-                
-                // Создаем lua скрипт
-                let luaScript = `-- DepotDownloader Lua Script\n`;
-                luaScript += `-- Generated for AppID: ${gameId}\n`;
+                // Создаем .lua файл для SteamLuaTools
+                let luaScript = `-- SteamLuaTools Manifest Script\n`;
+                luaScript += `-- AppID: ${gameId}\n`;
                 luaScript += `-- Token: ${token}\n\n`;
                 luaScript += `local appid = "${gameId}"\n`;
                 luaScript += `local token = "${token}"\n\n`;
                 luaScript += `-- Depot keys\n`;
                 luaScript += `local depotKeys = {\n`;
                 const keys = Object.entries(depotKeys);
-                keys.forEach(([depotId, key], index) => {
-                    const comma = index < keys.length - 1 ? ',' : '';
-                    luaScript += `    ["${depotId}"] = "${key}"${comma}\n`;
-                });
+                if (keys.length === 0) {
+                    luaScript += `    -- No depot keys found\n`;
+                } else {
+                    keys.forEach(([depotId, key], index) => {
+                        const comma = index < keys.length - 1 ? ',' : '';
+                        luaScript += `    ["${depotId}"] = "${key}"${comma}\n`;
+                    });
+                }
                 luaScript += `}\n\n`;
                 luaScript += `-- Command for depotdownloader\n`;
                 luaScript += `local cmd = "depotdownloader -app " .. appid .. " -token " .. token\n`;
@@ -437,21 +430,14 @@
                 luaScript += `print(cmd)\n`;
                 luaScript += `-- Or execute it directly using os.execute(cmd)`;
                 
-                folder.file('manifest.lua', luaScript);
-                
-                // Добавляем README
-                const readme = `# Манифесты для AppID: ${gameId}\n\n`;
-                const readme2 = `Токен: ${token}\n`;
-                const readme3 = `Ключей депотов: ${Object.keys(depotKeys).length}\n\n`;
-                const readme4 = `Используйте manifest.lua для depotdownloader`;
-                folder.file('README.md', readme + readme2 + readme3 + readme4);
+                zip.file(`${gameId}.lua`, luaScript);
 
                 terminalOutput.textContent += `📦 Генерация ZIP...\n`;
 
                 // Генерируем ZIP
                 const zipBlob = await zip.generateAsync({ type: 'blob' });
                 
-                terminalOutput.textContent += `✔ Готово. Скачивание...\n`;
+                terminalOutput.textContent += `✔ Готово.`;
 
                 // Скачиваем ZIP
                 downloadZip(zipBlob, `manifest_${gameId}.zip`);
