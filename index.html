@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Генератор Manifest для SteamLuaTools</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css" />
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
     <style>
         * {
             margin: 0;
@@ -323,13 +324,16 @@
             tick();
         }
 
-        function triggerDownload(url) {
+        function downloadZip(zipData, filename) {
+            const blob = new Blob([zipData], { type: 'application/zip' });
+            const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
-            a.download = '';
+            a.download = filename;
             document.body.appendChild(a);
             a.click();
             document.body.removeChild(a);
+            setTimeout(() => URL.revokeObjectURL(url), 5000);
         }
 
         async function checkManifest() {
@@ -354,73 +358,106 @@
             });
 
             try {
-                // Ищем токен в tokenstest.json
+                // Загружаем tokenstest.json
                 let token = null;
                 let tokensData = null;
                 
-                try {
-                    const tokensResponse = await fetch('tokenstest.json');
-                    if (tokensResponse.ok) {
-                        const tokensText = await tokensResponse.text();
-                        tokensData = JSON.parse(tokensText);
-                        token = tokensData[gameId];
-                    }
-                } catch (e) {
-                    console.warn('Ошибка загрузки tokenstest.json:', e);
+                const tokensResponse = await fetch('tokenstest.json');
+                if (!tokensResponse.ok) {
+                    throw new Error('Не удалось загрузить tokenstest.json');
                 }
+                const tokensText = await tokensResponse.text();
+                tokensData = JSON.parse(tokensText);
+                token = tokensData[gameId];
 
-                // Если токен найден
-                if (token) {
-                    const foundMsg = `✅ Манифест найден!\n📦 AppID: ${gameId}\n📦 Токен: ${token}\n`;
-                    await new Promise((resolve) => {
-                        typeText(foundMsg, resolve);
-                    });
-
-                    // Ищем ключи депотов в depotkeys.json
-                    let depotKeys = null;
-                    try {
-                        const depotResponse = await fetch('depotkeys.json');
-                        if (depotResponse.ok) {
-                            const depotText = await depotResponse.text();
-                            depotKeys = JSON.parse(depotText);
-                            terminalOutput.textContent += `📦 Найдено ключей депотов: ${Object.keys(depotKeys).length}\n`;
-                        }
-                    } catch (e) {
-                        console.warn('Ошибка загрузки depotkeys.json:', e);
-                    }
-
-                    // Создаем архив с манифестами
-                    terminalOutput.textContent += `📦 Подготовка архива...\n`;
-
-                    // Формируем данные для скачивания
-                    const manifestData = {
-                        appId: gameId,
-                        token: token,
-                        depotKeys: depotKeys || {},
-                        generatedAt: new Date().toISOString()
-                    };
-
-                    const blob = new Blob([JSON.stringify(manifestData, null, 2)], { type: 'application/json' });
-                    const url = URL.createObjectURL(blob);
-
-                    terminalOutput.textContent += `✔ Готово.`;
-
-                    // Скачиваем JSON с данными
-                    triggerDownload(url);
-
-                    // Освобождаем URL
-                    setTimeout(() => URL.revokeObjectURL(url), 5000);
-
-                } else {
-                    const notFoundMsg = `❌ Манифест для AppID ${gameId} не найден в базе.\nПопробуйте другой ID.`;
+                if (!token) {
+                    const notFoundMsg = `❌ Манифест для AppID ${gameId} не найден.\nПопробуйте другой ID.`;
                     await new Promise((resolve) => {
                         typeText(notFoundMsg, resolve);
                     });
                     notFoundSection.classList.remove('hidden');
+                    checkBtn.disabled = false;
+                    checkBtn.innerHTML = '<i class="fas fa-magnifying-glass"></i> Скачать';
+                    return;
                 }
 
+                // Загружаем depotkeys.json
+                let depotKeys = {};
+                try {
+                    const depotResponse = await fetch('depotkeys.json');
+                    if (depotResponse.ok) {
+                        const depotText = await depotResponse.text();
+                        depotKeys = JSON.parse(depotText);
+                    }
+                } catch (e) {
+                    console.warn('Depotkeys не загружены:', e);
+                }
+
+                const foundMsg = `✅ Манифест найден!\n📦 AppID: ${gameId}\n📦 Токен: ${token}\n📦 Ключей депотов: ${Object.keys(depotKeys).length}\n`;
+                await new Promise((resolve) => {
+                    typeText(foundMsg, resolve);
+                });
+
+                terminalOutput.textContent += `📦 Создание ZIP архива...\n`;
+
+                // Создаем ZIP архив
+                const zip = new JSZip();
+                
+                // Создаем папку с AppID
+                const folder = zip.folder(gameId);
+                
+                // Добавляем token.json
+                folder.file('token.json', JSON.stringify({ appId: gameId, token: token }, null, 2));
+                
+                // Добавляем depotkeys.json
+                if (Object.keys(depotKeys).length > 0) {
+                    folder.file('depotkeys.json', JSON.stringify(depotKeys, null, 2));
+                }
+                
+                // Создаем lua скрипт
+                let luaScript = `-- DepotDownloader Lua Script\n`;
+                luaScript += `-- Generated for AppID: ${gameId}\n`;
+                luaScript += `-- Token: ${token}\n\n`;
+                luaScript += `local appid = "${gameId}"\n`;
+                luaScript += `local token = "${token}"\n\n`;
+                luaScript += `-- Depot keys\n`;
+                luaScript += `local depotKeys = {\n`;
+                const keys = Object.entries(depotKeys);
+                keys.forEach(([depotId, key], index) => {
+                    const comma = index < keys.length - 1 ? ',' : '';
+                    luaScript += `    ["${depotId}"] = "${key}"${comma}\n`;
+                });
+                luaScript += `}\n\n`;
+                luaScript += `-- Command for depotdownloader\n`;
+                luaScript += `local cmd = "depotdownloader -app " .. appid .. " -token " .. token\n`;
+                luaScript += `for depotId, key in pairs(depotKeys) do\n`;
+                luaScript += `    cmd = cmd .. " -depot " .. depotId .. " -manifest " .. key\n`;
+                luaScript += `end\n\n`;
+                luaScript += `print("Run this command:")\n`;
+                luaScript += `print(cmd)\n`;
+                luaScript += `-- Or execute it directly using os.execute(cmd)`;
+                
+                folder.file('manifest.lua', luaScript);
+                
+                // Добавляем README
+                const readme = `# Манифесты для AppID: ${gameId}\n\n`;
+                const readme2 = `Токен: ${token}\n`;
+                const readme3 = `Ключей депотов: ${Object.keys(depotKeys).length}\n\n`;
+                const readme4 = `Используйте manifest.lua для depotdownloader`;
+                folder.file('README.md', readme + readme2 + readme3 + readme4);
+
+                terminalOutput.textContent += `📦 Генерация ZIP...\n`;
+
+                // Генерируем ZIP
+                const zipBlob = await zip.generateAsync({ type: 'blob' });
+                
+                terminalOutput.textContent += `✔ Готово. Скачивание...\n`;
+
+                // Скачиваем ZIP
+                downloadZip(zipBlob, `manifest_${gameId}.zip`);
+
             } catch (err) {
-                const errorMsg = `⚠️ Ошибка соединения. Проверьте файлы и повторите.\n${err.message || ''}`;
+                const errorMsg = `⚠️ Ошибка: ${err.message || 'Неизвестная ошибка'}`;
                 await new Promise((resolve) => {
                     typeText(errorMsg, resolve);
                 });
@@ -445,7 +482,7 @@
             }
         });
 
-        console.log('Генератор Manifest для SteamLuaTools — локальные файлы');
+        console.log('Генератор Manifest для SteamLuaTools');
     })();
 </script>
 </body>
