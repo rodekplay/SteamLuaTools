@@ -322,15 +322,6 @@
             tick();
         }
 
-        function triggerDownload(url) {
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = '';
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-        }
-
         // Загрузка локальных файлов
         async function loadLocalFiles() {
             try {
