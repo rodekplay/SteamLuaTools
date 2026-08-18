@@ -348,71 +348,71 @@
             resultsSection.classList.add('visible');
             notFoundSection.classList.add('hidden');
 
-            const startMsg = `🔍 Проверка манифеста для AppID: ${gameId}\n📡 Загрузка данных...\n`;
+            const startMsg = `🔍 Проверка манифеста для AppID: ${gameId}\n📡 Запрос к локальной базе...\n`;
             await new Promise((resolve) => {
                 typeText(startMsg, resolve);
             });
 
             try {
-                // Пытаемся загрузить tokenstest.json
+                // Ищем токен в tokenstest.json
                 let token = null;
+                let tokensData = null;
+                
                 try {
                     const tokensResponse = await fetch('tokenstest.json');
                     if (tokensResponse.ok) {
                         const tokensText = await tokensResponse.text();
-                        const tokensData = JSON.parse(tokensText);
+                        tokensData = JSON.parse(tokensText);
                         token = tokensData[gameId];
                     }
                 } catch (e) {
                     console.warn('Ошибка загрузки tokenstest.json:', e);
                 }
 
-                // Если токен не найден, ищем в depotkeys.json
-                let depotKeys = null;
-                try {
-                    const depotResponse = await fetch('depotkeys.json');
-                    if (depotResponse.ok) {
-                        const depotText = await depotResponse.text();
-                        depotKeys = JSON.parse(depotText);
-                    }
-                } catch (e) {
-                    console.warn('Ошибка загрузки depotkeys.json:', e);
-                }
-
+                // Если токен найден
                 if (token) {
-                    // Токен найден!
-                    const foundMsg = `✅ Токен найден!\n📦 AppID: ${gameId}\n📦 Токен: ${token}\n`;
+                    const foundMsg = `✅ Манифест найден!\n📦 AppID: ${gameId}\n📦 Токен: ${token}\n`;
                     await new Promise((resolve) => {
                         typeText(foundMsg, resolve);
                     });
 
-                    if (depotKeys && Object.keys(depotKeys).length > 0) {
-                        terminalOutput.textContent += `📦 Найдено ключей депотов: ${Object.keys(depotKeys).length}\n`;
+                    // Ищем ключи депотов в depotkeys.json
+                    let depotKeys = null;
+                    try {
+                        const depotResponse = await fetch('depotkeys.json');
+                        if (depotResponse.ok) {
+                            const depotText = await depotResponse.text();
+                            depotKeys = JSON.parse(depotText);
+                            terminalOutput.textContent += `📦 Найдено ключей депотов: ${Object.keys(depotKeys).length}\n`;
+                        }
+                    } catch (e) {
+                        console.warn('Ошибка загрузки depotkeys.json:', e);
                     }
 
-                    // Создаем архив с манифестами (имитация)
-                    terminalOutput.textContent += `\n📦 Создание архива с манифестами...\n`;
-                    
-                    // Вместо скачивания с GitHub, создаем локальный файл
+                    // Создаем архив с манифестами
+                    terminalOutput.textContent += `📦 Подготовка архива...\n`;
+
+                    // Формируем данные для скачивания
                     const manifestData = {
                         appId: gameId,
                         token: token,
-                        depotKeys: depotKeys || {}
+                        depotKeys: depotKeys || {},
+                        generatedAt: new Date().toISOString()
                     };
-                    
+
                     const blob = new Blob([JSON.stringify(manifestData, null, 2)], { type: 'application/json' });
                     const url = URL.createObjectURL(blob);
-                    
-                    terminalOutput.textContent += `✔ Готово. Скачивание манифеста...\n`;
-                    
+
+                    terminalOutput.textContent += `✔ Готово.`;
+
                     // Скачиваем JSON с данными
                     triggerDownload(url);
-                    
-                    // Освобождаем URL после скачивания
+
+                    // Освобождаем URL
                     setTimeout(() => URL.revokeObjectURL(url), 5000);
 
                 } else {
-                    const notFoundMsg = `❌ Манифест для AppID ${gameId} не найден.\nПопробуйте другой ID.`;
+                    const notFoundMsg = `❌ Манифест для AppID ${gameId} не найден в базе.\nПопробуйте другой ID.`;
                     await new Promise((resolve) => {
                         typeText(notFoundMsg, resolve);
                     });
@@ -420,7 +420,7 @@
                 }
 
             } catch (err) {
-                const errorMsg = `⚠️ Ошибка: ${err.message || 'Неизвестная ошибка'}`;
+                const errorMsg = `⚠️ Ошибка соединения. Проверьте файлы и повторите.\n${err.message || ''}`;
                 await new Promise((resolve) => {
                     typeText(errorMsg, resolve);
                 });
