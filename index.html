@@ -21,7 +21,7 @@
             padding: 20px;
         }
         .glass-card {
-            max-width: 800px;
+            max-width: 700px;
             width: 100%;
             background: rgba(44, 47, 51, 0.7);
             backdrop-filter: blur(8px);
@@ -52,38 +52,6 @@
             margin-bottom: 32px;
             border-bottom: 1px solid rgba(255, 255, 255, 0.04);
             padding-bottom: 18px;
-        }
-        .file-status {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 12px;
-            justify-content: center;
-            margin-bottom: 24px;
-            padding: 12px;
-            background: rgba(0, 0, 0, 0.2);
-            border-radius: 16px;
-        }
-        .file-badge {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            padding: 6px 16px;
-            border-radius: 40px;
-            font-size: 0.8rem;
-            font-weight: 500;
-            background: rgba(255, 255, 255, 0.05);
-            border: 1px solid rgba(255, 255, 255, 0.06);
-            color: #b9bbbe;
-        }
-        .file-badge.loaded {
-            border-color: #3ba55c;
-            color: #8cffb0;
-        }
-        .file-badge i {
-            font-size: 0.9rem;
-        }
-        .file-badge.loaded i {
-            color: #3ba55c;
         }
         .input-group {
             display: flex;
@@ -174,7 +142,7 @@
         }
         .terminal {
             font-family: 'Fira Code', 'JetBrains Mono', 'Courier New', monospace;
-            font-size: 0.85rem;
+            font-size: 0.9rem;
             color: #b9bbbe;
             background: #1e1f22;
             padding: 16px 18px;
@@ -185,19 +153,8 @@
             line-height: 1.6;
             border-left: 3px solid #5865f2;
             box-shadow: inset 0 2px 6px rgba(0,0,0,0.4);
-            max-height: 400px;
-            overflow-y: auto;
         }
         .terminal .highlight {
-            color: #a6c8ff;
-        }
-        .terminal .depot-line {
-            color: #f0b57c;
-        }
-        .terminal .token-line {
-            color: #8cffb0;
-        }
-        .terminal .lua-line {
             color: #a6c8ff;
         }
         .action-row {
@@ -285,35 +242,6 @@
             0% { transform: rotate(0deg); }
             100% { transform: rotate(360deg); }
         }
-        .copy-btn {
-            background: rgba(255,255,255,0.06);
-            border: 1px solid rgba(255,255,255,0.08);
-            border-radius: 40px;
-            padding: 6px 16px;
-            color: #b9bbbe;
-            font-size: 0.8rem;
-            cursor: pointer;
-            display: inline-flex;
-            align-items: center;
-            gap: 6px;
-            transition: 0.2s;
-        }
-        .copy-btn:hover {
-            background: rgba(255,255,255,0.12);
-            color: white;
-        }
-        .lua-output {
-            margin-top: 12px;
-        }
-        .lua-output .terminal {
-            border-left-color: #3ba55c;
-        }
-        .btn-success {
-            background: #3ba55c;
-        }
-        .btn-success:hover {
-            background: #2d8c4a;
-        }
     </style>
 </head>
 <body>
@@ -324,16 +252,7 @@
         <span>Генератор «Manifest»</span>
     </div>
     <div class="sub-head">
-        для SteamLuaTools — локальные файлы
-    </div>
-
-    <div class="file-status" id="fileStatus">
-        <span class="file-badge" id="depotBadge">
-            <i class="fas fa-file"></i> depotkeys.json
-        </span>
-        <span class="file-badge" id="tokenBadge">
-            <i class="fas fa-file"></i> tokenstest.txt
-        </span>
+        для SteamLuaTools
     </div>
 
     <div class="input-group">
@@ -341,7 +260,7 @@
         <div class="input-row">
             <input type="text" id="gameId" placeholder="Например, 220968" />
             <button id="checkBtn" class="btn-primary">
-                <i class="fas fa-magnifying-glass"></i> Сгенерировать
+                <i class="fas fa-magnifying-glass"></i> Скачать
             </button>
         </div>
     </div>
@@ -350,14 +269,8 @@
         <div class="terminal" id="terminalOutput"></div>
         <div class="action-row">
             <div id="notFoundSection" class="hidden">
-                <span class="notfound-badge"><i class="fas fa-circle-exclamation"></i> Данные не найдены</span>
+                <span class="notfound-badge"><i class="fas fa-circle-exclamation"></i> Манифест не найден</span>
             </div>
-            <button id="copyLuaBtn" class="copy-btn hidden">
-                <i class="fas fa-copy"></i> Копировать Lua
-            </button>
-        </div>
-        <div id="luaOutputSection" class="lua-output hidden">
-            <div class="terminal" id="luaOutput"></div>
         </div>
     </div>
 
@@ -380,73 +293,32 @@
         const checkBtn = document.getElementById('checkBtn');
         const resultsSection = document.getElementById('resultsSection');
         const terminalOutput = document.getElementById('terminalOutput');
-        const luaOutput = document.getElementById('luaOutput');
-        const luaOutputSection = document.getElementById('luaOutputSection');
         const notFoundSection = document.getElementById('notFoundSection');
-        const copyLuaBtn = document.getElementById('copyLuaBtn');
-        const depotBadge = document.getElementById('depotBadge');
-        const tokenBadge = document.getElementById('tokenBadge');
 
+        resultsSection.classList.add('hidden');
+
+        // ===== ЛОКАЛЬНЫЕ ДАННЫЕ =====
+        // depotKeys — объект с депотами (ключи)
+        // accessTokens — объект с токенами
         let depotKeys = {};
         let accessTokens = {};
         let filesLoaded = false;
 
-        // Загрузка файлов
-        async function loadFiles() {
-            try {
-                // Загрузка depotkeys.json
-                const depotResponse = await fetch('depotkeys.json');
-                if (depotResponse.ok) {
-                    depotKeys = await depotResponse.json();
-                    depotBadge.classList.add('loaded');
-                    depotBadge.innerHTML = '<i class="fas fa-check-circle"></i> depotkeys.json (' + Object.keys(depotKeys).length + ' ключей)';
-                } else {
-                    depotBadge.innerHTML = '<i class="fas fa-exclamation-triangle"></i> depotkeys.json не загружен';
-                }
-
-                // Загрузка tokenstest.txt
-                const tokenResponse = await fetch('tokenstest.txt');
-                if (tokenResponse.ok) {
-                    const text = await tokenResponse.text();
-                    try {
-                        accessTokens = JSON.parse(text);
-                        tokenBadge.classList.add('loaded');
-                        tokenBadge.innerHTML = '<i class="fas fa-check-circle"></i> tokenstest.txt (' + Object.keys(accessTokens).length + ' токенов)';
-                    } catch (e) {
-                        tokenBadge.innerHTML = '<i class="fas fa-exclamation-triangle"></i> Ошибка парсинга tokenstest.txt';
-                    }
-                } else {
-                    tokenBadge.innerHTML = '<i class="fas fa-exclamation-triangle"></i> tokenstest.txt не загружен';
-                }
-
-                filesLoaded = true;
-            } catch (err) {
-                console.error('Ошибка загрузки файлов:', err);
-            }
-        }
-
-        loadFiles();
-
-        resultsSection.classList.add('hidden');
-
         function resetUI() {
             notFoundSection.classList.add('hidden');
-            luaOutputSection.classList.add('hidden');
-            copyLuaBtn.classList.add('hidden');
             terminalOutput.textContent = '';
-            luaOutput.textContent = '';
             checkBtn.disabled = false;
-            checkBtn.innerHTML = '<i class="fas fa-magnifying-glass"></i> Сгенерировать';
+            checkBtn.innerHTML = '<i class="fas fa-magnifying-glass"></i> Скачать';
         }
 
-        function typeText(element, text, callback) {
+        function typeText(text, callback) {
             let index = 0;
-            element.textContent = '';
+            terminalOutput.textContent = '';
             function tick() {
                 if (index < text.length) {
-                    element.textContent += text.charAt(index);
+                    terminalOutput.textContent += text.charAt(index);
                     index++;
-                    setTimeout(tick, 12);
+                    setTimeout(tick, 18);
                 } else {
                     if (callback) callback();
                 }
@@ -454,171 +326,142 @@
             tick();
         }
 
-        function generateLua(appId, depots, token) {
-            let lines = [];
-            lines.push(`-- OpenSteamTool Lua конфиг для AppID: ${appId}`);
-            lines.push(`-- Сгенерировано из локальных файлов`);
-            lines.push('');
-
-            // Добавляем основной AppID
-            lines.push(`addappid(${appId})`);
-            lines.push('');
-
-            // Добавляем депоты с ключами
-            let hasDepots = false;
-            for (const [depotId, key] of Object.entries(depots)) {
-                if (key && key.length === 64) {
-                    lines.push(`addappid(${depotId}, 1, "${key}")`);
-                    hasDepots = true;
-                } else if (key) {
-                    lines.push(`addappid(${depotId}) -- ключ отсутствует или неверной длины`);
+        // Загрузка файлов
+        async function loadFiles() {
+            try {
+                const depotResp = await fetch('depotkeys.json');
+                if (depotResp.ok) {
+                    depotKeys = await depotResp.json();
                 }
+
+                const tokenResp = await fetch('tokenstest.txt');
+                if (tokenResp.ok) {
+                    const text = await tokenResp.text();
+                    try {
+                        accessTokens = JSON.parse(text);
+                    } catch (e) {
+                        console.warn('Ошибка парсинга tokenstest.txt');
+                    }
+                }
+
+                filesLoaded = true;
+            } catch (err) {
+                console.warn('Ошибка загрузки файлов:', err);
+                filesLoaded = true;
             }
-
-            if (!hasDepots) {
-                lines.push(`-- Ключи для депотов не найдены`);
-            }
-
-            // Добавляем токен если есть
-            if (token) {
-                lines.push('');
-                lines.push(`addtoken(${appId}, "${token}")`);
-            }
-
-            lines.push('');
-            lines.push(`-- Конец конфига`);
-
-            return lines.join('\n');
         }
 
-        async function generateManifest() {
+        loadFiles();
+
+        async function checkManifest() {
             const gameId = gameIdInput.value.trim();
 
             if (!gameId || !/^\d+$/.test(gameId)) {
                 resultsSection.classList.remove('hidden');
                 notFoundSection.classList.add('hidden');
-                typeText(terminalOutput, '⚠️ Ошибка: введите корректный Steam AppID (только цифры).');
+                typeText('⚠️ Ошибка: введите корректный Steam AppID (только цифры).');
                 return;
             }
 
             checkBtn.disabled = true;
-            checkBtn.innerHTML = '<span class="spinner"></i> Поиск...';
+            checkBtn.innerHTML = '<span class="spinner"></span> Поиск...';
 
             resultsSection.classList.remove('hidden');
             notFoundSection.classList.add('hidden');
-            luaOutputSection.classList.add('hidden');
-            copyLuaBtn.classList.add('hidden');
 
-            const startMsg = `🔍 Поиск данных для AppID: ${gameId}\n📦 Проверка локальных файлов...\n`;
+            const startMsg = `🔍 Проверка манифеста для AppID: ${gameId}\n📡 Запрос к локальной базе...\n`;
             await new Promise((resolve) => {
-                typeText(terminalOutput, startMsg, resolve);
+                typeText(startMsg, resolve);
             });
 
-            // Проверяем наличие файлов
-            if (!filesLoaded || Object.keys(depotKeys).length === 0) {
-                const errorMsg = `\n⚠️ Файлы не загружены. Проверьте:\n• depotkeys.json\n• tokenstest.txt\nОни должны находиться в той же папке.`;
-                terminalOutput.textContent += errorMsg;
-                checkBtn.disabled = false;
-                checkBtn.innerHTML = '<i class="fas fa-magnifying-glass"></i> Сгенерировать';
-                return;
+            // Если файлы ещё не загружены, ждём немного
+            let attempts = 0;
+            while (!filesLoaded && attempts < 20) {
+                await new Promise(r => setTimeout(r, 100));
+                attempts++;
             }
 
-            // Ищем депоты для этого AppID
-            const appDepots = {};
-            let foundAny = false;
+            // Ищем в локальных данных
+            // В depotkeys.json ключи — это DepotID
+            // В accessTokens ключи — это AppID
+            const foundDepots = [];
+            const token = accessTokens[gameId] || null;
 
-            // В depotkeys.json ключи - это DepotID, а не AppID
-            // Нам нужно найти депоты, которые принадлежат этому AppID
-            // В реальности нужен отдельный файл с маппингом AppID -> DepotID
-            // Для демонстрации будем искать депоты, которые начинаются с AppID или точно совпадают
+            // Ищем депоты, связанные с этим AppID (по префиксу или точному совпадению)
             for (const [depotId, key] of Object.entries(depotKeys)) {
-                // Проверяем: depotId может быть связан с AppID через префикс или точное совпадение
-                // В реальных данных часто depotId = AppID + суффикс (например 730 -> 731)
                 if (depotId === gameId || depotId.startsWith(gameId + '0') || depotId.startsWith(gameId + '1')) {
-                    appDepots[depotId] = key;
-                    foundAny = true;
+                    foundDepots.push({ depotId, key });
                 }
             }
 
-            // Если не нашли по префиксу, ищем точное совпадение с AppID в ключах
-            if (!foundAny && depotKeys[gameId]) {
-                appDepots[gameId] = depotKeys[gameId];
-                foundAny = true;
+            // Если не нашли по префиксу, берём точное совпадение
+            if (foundDepots.length === 0 && depotKeys[gameId]) {
+                foundDepots.push({ depotId: gameId, key: depotKeys[gameId] });
             }
 
-            // Ищем токен
-            const token = accessTokens[gameId] || null;
-
-            let resultMsg = '';
-            if (foundAny || token) {
-                resultMsg += `\n✅ Найдены данные для AppID ${gameId}!\n`;
-                if (Object.keys(appDepots).length > 0) {
-                    resultMsg += `📦 Найдено ${Object.keys(appDepots).length} депотов с ключами.\n`;
+            if (foundDepots.length > 0 || token) {
+                let resultMsg = `✅ Найдены данные для AppID ${gameId}!\n`;
+                if (foundDepots.length > 0) {
+                    resultMsg += `📦 Найдено ${foundDepots.length} депотов с ключами.\n`;
                 }
                 if (token) {
                     resultMsg += `🔑 Найден Access Token.\n`;
                 }
-                resultMsg += `\n📝 Генерация Lua конфига...\n`;
+                resultMsg += `📥 Генерация Lua конфига...\n`;
 
-                terminalOutput.textContent += resultMsg;
+                // Генерируем Lua конфиг
+                let luaLines = [];
+                luaLines.push(`-- OpenSteamTool Lua конфиг для AppID: ${gameId}`);
+                luaLines.push(`-- Сгенерировано из локальных файлов`);
+                luaLines.push('');
+                luaLines.push(`addappid(${gameId})`);
+                luaLines.push('');
 
-                // Генерируем Lua
-                const luaContent = generateLua(gameId, appDepots, token);
-                luaOutput.textContent = luaContent;
-                luaOutputSection.classList.remove('hidden');
-                copyLuaBtn.classList.remove('hidden');
+                for (const depot of foundDepots) {
+                    if (depot.key && depot.key.length === 64) {
+                        luaLines.push(`addappid(${depot.depotId}, 1, "${depot.key}")`);
+                    } else {
+                        luaLines.push(`addappid(${depot.depotId}) -- ключ отсутствует`);
+                    }
+                }
 
-                // Показываем финальное сообщение
-                terminalOutput.textContent += `\n✔ Готово. Lua конфиг сгенерирован ниже.`;
+                if (token) {
+                    luaLines.push('');
+                    luaLines.push(`addtoken(${gameId}, "${token}")`);
+                }
 
+                luaLines.push('');
+                luaLines.push(`-- Конец конфига`);
+
+                const luaContent = luaLines.join('\n');
+                resultMsg += `\n${luaContent}\n`;
+
+                await new Promise((resolve) => {
+                    typeText(resultMsg, resolve);
+                });
             } else {
-                const notFoundMsg = `\n❌ Данные для AppID ${gameId} не найдены.\nПопробуйте другой ID.`;
-                terminalOutput.textContent += notFoundMsg;
+                const notFoundMsg = `❌ Манифест для AppID ${gameId} не найден в локальной базе.\nПопробуйте другой ID.`;
+                await new Promise((resolve) => {
+                    typeText(notFoundMsg, resolve);
+                });
                 notFoundSection.classList.remove('hidden');
             }
 
             checkBtn.disabled = false;
-            checkBtn.innerHTML = '<i class="fas fa-magnifying-glass"></i> Сгенерировать';
+            checkBtn.innerHTML = '<i class="fas fa-magnifying-glass"></i> Скачать';
         }
-
-        // Копирование Lua
-        copyLuaBtn.addEventListener('click', function() {
-            const text = luaOutput.textContent;
-            if (text) {
-                navigator.clipboard.writeText(text).then(() => {
-                    const original = copyLuaBtn.innerHTML;
-                    copyLuaBtn.innerHTML = '<i class="fas fa-check"></i> Скопировано!';
-                    setTimeout(() => {
-                        copyLuaBtn.innerHTML = original;
-                    }, 2000);
-                }).catch(() => {
-                    // fallback
-                    const range = document.createRange();
-                    range.selectNode(luaOutput);
-                    window.getSelection().removeAllRanges();
-                    window.getSelection().addRange(range);
-                    document.execCommand('copy');
-                    window.getSelection().removeAllRanges();
-                    const original = copyLuaBtn.innerHTML;
-                    copyLuaBtn.innerHTML = '<i class="fas fa-check"></i> Скопировано!';
-                    setTimeout(() => {
-                        copyLuaBtn.innerHTML = original;
-                    }, 2000);
-                });
-            }
-        });
 
         checkBtn.addEventListener('click', function(e) {
             e.preventDefault();
             resetUI();
-            generateManifest();
+            checkManifest();
         });
 
         gameIdInput.addEventListener('keypress', function(e) {
             if (e.key === 'Enter') {
                 e.preventDefault();
                 resetUI();
-                generateManifest();
+                checkManifest();
             }
         });
 
