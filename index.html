@@ -146,7 +146,7 @@
         }
         .terminal {
             font-family: 'Fira Code', 'JetBrains Mono', 'Courier New', monospace;
-            font-size: 0.85rem;
+            font-size: 0.9rem;
             color: #b9bbbe;
             background: #1e1f22;
             padding: 16px 18px;
@@ -157,8 +157,6 @@
             line-height: 1.6;
             border-left: 3px solid #5865f2;
             box-shadow: inset 0 2px 6px rgba(0,0,0,0.4);
-            max-height: 400px;
-            overflow-y: auto;
         }
         .terminal .highlight {
             color: #a6c8ff;
@@ -169,7 +167,7 @@
             align-items: center;
             justify-content: flex-end;
             gap: 12px;
-            margin-top: 12px;
+            margin-top: 6px;
             min-height: 10px;
         }
         .notfound-badge {
@@ -248,32 +246,6 @@
             0% { transform: rotate(0deg); }
             100% { transform: rotate(360deg); }
         }
-        .copy-btn {
-            background: rgba(255, 255, 255, 0.1);
-            border: 1px solid rgba(255, 255, 255, 0.15);
-            border-radius: 30px;
-            padding: 8px 16px;
-            color: #d1d7e0;
-            cursor: pointer;
-            font-size: 0.85rem;
-            transition: 0.2s;
-            display: inline-flex;
-            align-items: center;
-            gap: 6px;
-        }
-        .copy-btn:hover {
-            background: rgba(255, 255, 255, 0.2);
-        }
-        .copy-btn.copied {
-            color: #6c8cff;
-            border-color: #6c8cff;
-        }
-        .info-text {
-            color: #8e9297;
-            font-size: 0.85rem;
-            margin-top: 8px;
-            text-align: center;
-        }
     </style>
 </head>
 <body>
@@ -300,9 +272,8 @@
     <div id="resultsSection">
         <div class="terminal" id="terminalOutput"></div>
         <div class="action-row">
-            <button id="copyBtn" class="copy-btn hidden"><i class="fas fa-copy"></i> Копировать</button>
             <div id="notFoundSection" class="hidden">
-                <span class="notfound-badge"><i class="fas fa-circle-exclamation"></i> Токен не найден</span>
+                <span class="notfound-badge"><i class="fas fa-circle-exclamation"></i> Манифест не найден</span>
             </div>
         </div>
     </div>
@@ -327,21 +298,11 @@
         const resultsSection = document.getElementById('resultsSection');
         const terminalOutput = document.getElementById('terminalOutput');
         const notFoundSection = document.getElementById('notFoundSection');
-        const copyBtn = document.getElementById('copyBtn');
-
-        let tokensData = {};
-        let depotKeysData = {};
-        let generatedScript = '';
-        let isDataLoaded = false;
 
         resultsSection.classList.remove('visible');
-        copyBtn.classList.add('hidden');
 
         function resetUI() {
             notFoundSection.classList.add('hidden');
-            copyBtn.classList.add('hidden');
-            copyBtn.classList.remove('copied');
-            copyBtn.innerHTML = '<i class="fas fa-copy"></i> Копировать';
             terminalOutput.textContent = '';
             checkBtn.disabled = false;
             checkBtn.innerHTML = '<i class="fas fa-magnifying-glass"></i> Скачать';
@@ -354,7 +315,7 @@
                 if (index < text.length) {
                     terminalOutput.textContent += text.charAt(index);
                     index++;
-                    setTimeout(tick, 12);
+                    setTimeout(tick, 18);
                 } else {
                     if (callback) callback();
                 }
@@ -362,64 +323,13 @@
             tick();
         }
 
-        function generateLuaScript(appId, token, depotKeys) {
-            let script = `-- DepotDownloader Lua Script\n`;
-            script += `-- Generated for AppID: ${appId}\n`;
-            script += `-- Token: ${token}\n\n`;
-            
-            script += `local appid = "${appId}"\n`;
-            script += `local token = "${token}"\n\n`;
-            
-            script += `-- Depot keys\n`;
-            script += `local depotKeys = {\n`;
-            
-            const keys = Object.entries(depotKeys);
-            if (keys.length === 0) {
-                script += `    -- Нет ключей депотов\n`;
-            } else {
-                // Показываем все ключи
-                keys.forEach(([depotId, key], index) => {
-                    const comma = index < keys.length - 1 ? ',' : '';
-                    script += `    ["${depotId}"] = "${key}"${comma}\n`;
-                });
-            }
-            
-            script += `}\n\n`;
-            script += `-- Command for depotdownloader\n`;
-            script += `local cmd = "depotdownloader -app " .. appid .. " -token " .. token\n`;
-            script += `for depotId, key in pairs(depotKeys) do\n`;
-            script += `    cmd = cmd .. " -depot " .. depotId .. " -manifest " .. key\n`;
-            script += `end\n\n`;
-            script += `print("Run this command:")\n`;
-            script += `print(cmd)\n`;
-            script += `-- Or execute it directly using os.execute(cmd)`;
-            
-            return script;
-        }
-
-        async function loadLocalData() {
-            try {
-                // Загружаем tokenstest.json (огромный файл в одну строку)
-                const tokensResponse = await fetch('tokenstest.json');
-                if (!tokensResponse.ok) {
-                    throw new Error(`Не удалось загрузить tokenstest.json (${tokensResponse.status})`);
-                }
-                const tokensText = await tokensResponse.text();
-                tokensData = JSON.parse(tokensText);
-
-                // Загружаем depotkeys.json
-                const depotResponse = await fetch('depotkeys.json');
-                if (!depotResponse.ok) {
-                    throw new Error(`Не удалось загрузить depotkeys.json (${depotResponse.status})`);
-                }
-                const depotText = await depotResponse.text();
-                depotKeysData = JSON.parse(depotText);
-
-                return true;
-            } catch (error) {
-                console.error('Ошибка загрузки файлов:', error);
-                return false;
-            }
+        function triggerDownload(url) {
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = '';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
         }
 
         async function checkManifest() {
@@ -428,7 +338,6 @@
             if (!gameId || !/^\d+$/.test(gameId)) {
                 resultsSection.classList.add('visible');
                 notFoundSection.classList.add('hidden');
-                copyBtn.classList.add('hidden');
                 typeText('⚠️ Ошибка: введите корректный Steam AppID (только цифры).');
                 return;
             }
@@ -438,122 +347,88 @@
 
             resultsSection.classList.add('visible');
             notFoundSection.classList.add('hidden');
-            copyBtn.classList.add('hidden');
 
-            const startMsg = `🔍 Проверка для AppID: ${gameId}\n📂 Загрузка локальных данных...\n`;
+            const startMsg = `🔍 Проверка манифеста для AppID: ${gameId}\n📡 Загрузка данных...\n`;
             await new Promise((resolve) => {
                 typeText(startMsg, resolve);
             });
 
-            // Загружаем локальные файлы
-            const loaded = await loadLocalData();
-            if (!loaded) {
-                const errorMsg = `⚠️ Ошибка: не удалось загрузить файлы tokenstest.json или depotkeys.json\nУбедитесь, что они находятся в той же папке, что и HTML файл.`;
-                await new Promise((resolve) => {
-                    typeText(errorMsg, resolve);
-                });
-                checkBtn.disabled = false;
-                checkBtn.innerHTML = '<i class="fas fa-magnifying-glass"></i> Скачать';
-                return;
-            }
-
-            // Ищем токен для gameId
-            const token = tokensData[gameId];
-            if (!token) {
-                const notFoundMsg = `❌ Токен для AppID ${gameId} не найден в tokenstest.json.\nПопробуйте другой ID.`;
-                await new Promise((resolve) => {
-                    typeText(notFoundMsg, resolve);
-                });
-                notFoundSection.classList.remove('hidden');
-                checkBtn.disabled = false;
-                checkBtn.innerHTML = '<i class="fas fa-magnifying-glass"></i> Скачать';
-                return;
-            }
-
-            // Получаем все ключи депотов
-            const depotKeys = depotKeysData;
-            
-            if (Object.keys(depotKeys).length === 0) {
-                const errorMsg = `⚠️ Не найдены ключи депотов в depotkeys.json.`;
-                await new Promise((resolve) => {
-                    typeText(errorMsg, resolve);
-                });
-                notFoundSection.classList.remove('hidden');
-                checkBtn.disabled = false;
-                checkBtn.innerHTML = '<i class="fas fa-magnifying-glass"></i> Скачать';
-                return;
-            }
-
-            // Формируем результаты
-            const foundMsg = `✅ Токен найден!\n📦 AppID: ${gameId}\n📦 Токен: ${token.substring(0, 16)}...${token.substring(token.length - 8)}\n📦 Ключей депотов: ${Object.keys(depotKeys).length}\n\n`;
-            await new Promise((resolve) => {
-                typeText(foundMsg, resolve);
-            });
-
-            // Выводим информацию о депотах (первые 10)
-            let depotInfo = '📂 Ключи депотов (первые 10):\n';
-            const entries = Object.entries(depotKeys).slice(0, 10);
-            entries.forEach(([depotId, key]) => {
-                depotInfo += `  ${depotId}: ${key.substring(0, 16)}...${key.substring(key.length - 8)}\n`;
-            });
-            if (Object.keys(depotKeys).length > 10) {
-                depotInfo += `  ... и еще ${Object.keys(depotKeys).length - 10} ключей\n`;
-            }
-            
-            terminalOutput.textContent += depotInfo;
-            
-            // Генерируем Lua скрипт
-            generatedScript = generateLuaScript(gameId, token, depotKeys);
-            
-            terminalOutput.textContent += `\n📝 Сгенерирован Lua скрипт:\n\n`;
-            terminalOutput.textContent += generatedScript;
-            
-            copyBtn.classList.remove('hidden');
-
-            checkBtn.disabled = false;
-            checkBtn.innerHTML = '<i class="fas fa-magnifying-glass"></i> Скачать';
-        }
-
-        // Копирование в буфер обмена
-        copyBtn.addEventListener('click', function() {
-            if (!generatedScript) return;
-            
-            if (navigator.clipboard && navigator.clipboard.writeText) {
-                navigator.clipboard.writeText(generatedScript).then(() => {
-                    copyBtn.innerHTML = '<i class="fas fa-check"></i> Скопировано!';
-                    copyBtn.classList.add('copied');
-                    setTimeout(() => {
-                        copyBtn.innerHTML = '<i class="fas fa-copy"></i> Копировать';
-                        copyBtn.classList.remove('copied');
-                    }, 2000);
-                }).catch(() => {
-                    fallbackCopy();
-                });
-            } else {
-                fallbackCopy();
-            }
-        });
-
-        function fallbackCopy() {
-            const textarea = document.createElement('textarea');
-            textarea.value = generatedScript;
-            textarea.style.position = 'fixed';
-            textarea.style.left = '-9999px';
-            textarea.style.top = '-9999px';
-            document.body.appendChild(textarea);
-            textarea.select();
             try {
-                document.execCommand('copy');
-                copyBtn.innerHTML = '<i class="fas fa-check"></i> Скопировано!';
-                copyBtn.classList.add('copied');
-                setTimeout(() => {
-                    copyBtn.innerHTML = '<i class="fas fa-copy"></i> Копировать';
-                    copyBtn.classList.remove('copied');
-                }, 2000);
+                // Пытаемся загрузить tokenstest.json
+                let token = null;
+                try {
+                    const tokensResponse = await fetch('tokenstest.json');
+                    if (tokensResponse.ok) {
+                        const tokensText = await tokensResponse.text();
+                        const tokensData = JSON.parse(tokensText);
+                        token = tokensData[gameId];
+                    }
+                } catch (e) {
+                    console.warn('Ошибка загрузки tokenstest.json:', e);
+                }
+
+                // Если токен не найден, ищем в depotkeys.json
+                let depotKeys = null;
+                try {
+                    const depotResponse = await fetch('depotkeys.json');
+                    if (depotResponse.ok) {
+                        const depotText = await depotResponse.text();
+                        depotKeys = JSON.parse(depotText);
+                    }
+                } catch (e) {
+                    console.warn('Ошибка загрузки depotkeys.json:', e);
+                }
+
+                if (token) {
+                    // Токен найден!
+                    const foundMsg = `✅ Токен найден!\n📦 AppID: ${gameId}\n📦 Токен: ${token}\n`;
+                    await new Promise((resolve) => {
+                        typeText(foundMsg, resolve);
+                    });
+
+                    if (depotKeys && Object.keys(depotKeys).length > 0) {
+                        terminalOutput.textContent += `📦 Найдено ключей депотов: ${Object.keys(depotKeys).length}\n`;
+                    }
+
+                    // Создаем архив с манифестами (имитация)
+                    terminalOutput.textContent += `\n📦 Создание архива с манифестами...\n`;
+                    
+                    // Вместо скачивания с GitHub, создаем локальный файл
+                    const manifestData = {
+                        appId: gameId,
+                        token: token,
+                        depotKeys: depotKeys || {}
+                    };
+                    
+                    const blob = new Blob([JSON.stringify(manifestData, null, 2)], { type: 'application/json' });
+                    const url = URL.createObjectURL(blob);
+                    
+                    terminalOutput.textContent += `✔ Готово. Скачивание манифеста...\n`;
+                    
+                    // Скачиваем JSON с данными
+                    triggerDownload(url);
+                    
+                    // Освобождаем URL после скачивания
+                    setTimeout(() => URL.revokeObjectURL(url), 5000);
+
+                } else {
+                    const notFoundMsg = `❌ Манифест для AppID ${gameId} не найден.\nПопробуйте другой ID.`;
+                    await new Promise((resolve) => {
+                        typeText(notFoundMsg, resolve);
+                    });
+                    notFoundSection.classList.remove('hidden');
+                }
+
             } catch (err) {
-                alert('Не удалось скопировать текст. Скопируйте вручную.');
+                const errorMsg = `⚠️ Ошибка: ${err.message || 'Неизвестная ошибка'}`;
+                await new Promise((resolve) => {
+                    typeText(errorMsg, resolve);
+                });
+                notFoundSection.classList.add('hidden');
+            } finally {
+                checkBtn.disabled = false;
+                checkBtn.innerHTML = '<i class="fas fa-magnifying-glass"></i> Скачать';
             }
-            document.body.removeChild(textarea);
         }
 
         checkBtn.addEventListener('click', function(e) {
@@ -571,7 +446,6 @@
         });
 
         console.log('Генератор Manifest для SteamLuaTools — локальные файлы');
-        console.log('Ожидаются файлы: tokenstest.json и depotkeys.json');
     })();
 </script>
 </body>
