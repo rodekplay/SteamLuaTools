@@ -242,6 +242,26 @@
             0% { transform: rotate(0deg); }
             100% { transform: rotate(360deg); }
         }
+        .copy-btn {
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            border-radius: 30px;
+            padding: 8px 16px;
+            color: #d1d7e0;
+            cursor: pointer;
+            font-size: 0.85rem;
+            transition: 0.2s;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .copy-btn:hover {
+            background: rgba(255, 255, 255, 0.2);
+        }
+        .copy-btn.copied {
+            color: #6c8cff;
+            border-color: #6c8cff;
+        }
     </style>
 </head>
 <body>
@@ -258,7 +278,7 @@
     <div class="input-group">
         <label for="gameId"><i class="fas fa-hashtag"></i> Введите AppID игры</label>
         <div class="input-row">
-            <input type="text" id="gameId" placeholder="Например, 220968" />
+            <input type="text" id="gameId" placeholder="Например, 730" />
             <button id="checkBtn" class="btn-primary">
                 <i class="fas fa-magnifying-glass"></i> Скачать
             </button>
@@ -268,8 +288,9 @@
     <div id="resultsSection" class="hidden">
         <div class="terminal" id="terminalOutput"></div>
         <div class="action-row">
+            <button id="copyBtn" class="copy-btn hidden"><i class="fas fa-copy"></i> Копировать</button>
             <div id="notFoundSection" class="hidden">
-                <span class="notfound-badge"><i class="fas fa-circle-exclamation"></i> Манифест не найден</span>
+                <span class="notfound-badge"><i class="fas fa-circle-exclamation"></i> Токен не найден</span>
             </div>
         </div>
     </div>
@@ -294,14 +315,20 @@
         const resultsSection = document.getElementById('resultsSection');
         const terminalOutput = document.getElementById('terminalOutput');
         const notFoundSection = document.getElementById('notFoundSection');
+        const copyBtn = document.getElementById('copyBtn');
 
         let tokensData = {};
         let depotKeysData = {};
+        let generatedScript = '';
 
         resultsSection.classList.add('hidden');
+        copyBtn.classList.add('hidden');
 
         function resetUI() {
             notFoundSection.classList.add('hidden');
+            copyBtn.classList.add('hidden');
+            copyBtn.classList.remove('copied');
+            copyBtn.innerHTML = '<i class="fas fa-copy"></i> Копировать';
             terminalOutput.textContent = '';
             checkBtn.disabled = false;
             checkBtn.innerHTML = '<i class="fas fa-magnifying-glass"></i> Скачать';
@@ -322,13 +349,43 @@
             tick();
         }
 
-        function triggerDownload(url) {
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = '';
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
+        function generateLuaScript(appId, token, depotKeys) {
+            let script = `-- DepotDownloader Lua Script\n`;
+            script += `-- Generated for AppID: ${appId}\n`;
+            script += `-- Token: ${token}\n\n`;
+            
+            script += `local appid = "${appId}"\n`;
+            script += `local token = "${token}"\n\n`;
+            
+            script += `-- Depot keys\n`;
+            script += `local depotKeys = {\n`;
+            
+            const keys = Object.entries(depotKeys);
+            if (keys.length === 0) {
+                script += `    -- Нет ключей депотов\n`;
+            } else {
+                // Показываем только первые 50 ключей для краткости
+                const displayKeys = keys.slice(0, 50);
+                displayKeys.forEach(([depotId, key], index) => {
+                    const comma = index < displayKeys.length - 1 ? ',' : '';
+                    script += `    ["${depotId}"] = "${key}"${comma}\n`;
+                });
+                if (keys.length > 50) {
+                    script += `    -- ... и еще ${keys.length - 50} ключей\n`;
+                }
+            }
+            
+            script += `}\n\n`;
+            script += `-- Command for depotdownloader\n`;
+            script += `local cmd = "depotdownloader -app " .. appid .. " -token " .. token\n`;
+            script += `for depotId, key in pairs(depotKeys) do\n`;
+            script += `    cmd = cmd .. " -depot " .. depotId .. " -manifest " .. key\n`;
+            script += `end\n\n`;
+            script += `print("Run this command:")\n`;
+            script += `print(cmd)\n`;
+            script += `-- Or execute it directly using os.execute(cmd)`;
+            
+            return script;
         }
 
         async function loadLocalData() {
@@ -360,6 +417,7 @@
             if (!gameId || !/^\d+$/.test(gameId)) {
                 resultsSection.classList.remove('hidden');
                 notFoundSection.classList.add('hidden');
+                copyBtn.classList.add('hidden');
                 typeText('⚠️ Ошибка: введите корректный Steam AppID (только цифры).');
                 return;
             }
@@ -369,6 +427,7 @@
 
             resultsSection.classList.remove('hidden');
             notFoundSection.classList.add('hidden');
+            copyBtn.classList.add('hidden');
 
             const startMsg = `🔍 Проверка манифеста для AppID: ${gameId}\n📂 Загрузка локальных данных...\n`;
             await new Promise((resolve) => {
@@ -387,7 +446,7 @@
                 return;
             }
 
-            // Ищем токен для gameId
+            // Ищем токен для gameId (ключи в tokenstest.json - это AppID)
             const token = tokensData[gameId];
             if (!token) {
                 const notFoundMsg = `❌ Токен для AppID ${gameId} не найден в tokenstest.json.\nПопробуйте другой ID.`;
@@ -400,9 +459,7 @@
                 return;
             }
 
-            // Ищем ключи депотов для этого токена
-            // В depotkeys.json ключи - это ID депотов, значения - хэши манифестов
-            // Мы просто берем все ключи
+            // Получаем все ключи депотов
             const depotKeys = depotKeysData;
             
             if (Object.keys(depotKeys).length === 0) {
@@ -417,26 +474,74 @@
             }
 
             // Формируем результаты
-            const foundMsg = `✅ Данные найдены!\n📦 Токен: ${token}\n📦 Найдено ключей депотов: ${Object.keys(depotKeys).length}\n\n`;
+            const foundMsg = `✅ Данные найдены!\n📦 AppID: ${gameId}\n📦 Токен: ${token.substring(0, 16)}...${token.substring(token.length - 8)}\n📦 Найдено ключей депотов: ${Object.keys(depotKeys).length}\n\n`;
             await new Promise((resolve) => {
                 typeText(foundMsg, resolve);
             });
 
-            // Выводим информацию о депотах
-            let depotInfo = '📂 Ключи депотов:\n';
-            const entries = Object.entries(depotKeys).slice(0, 10); // Показываем первые 10
+            // Выводим информацию о депотах (первые 10)
+            let depotInfo = '📂 Ключи депотов (первые 10):\n';
+            const entries = Object.entries(depotKeys).slice(0, 10);
             entries.forEach(([depotId, key]) => {
-                depotInfo += `  ${depotId}: ${key.substring(0, 16)}...\n`;
+                depotInfo += `  ${depotId}: ${key.substring(0, 16)}...${key.substring(key.length - 8)}\n`;
             });
             if (Object.keys(depotKeys).length > 10) {
                 depotInfo += `  ... и еще ${Object.keys(depotKeys).length - 10} ключей\n`;
             }
             
             terminalOutput.textContent += depotInfo;
-            terminalOutput.textContent += `\n✔ Готово. Файлы найдены локально.`;
+            
+            // Генерируем Lua скрипт
+            generatedScript = generateLuaScript(gameId, token, depotKeys);
+            
+            terminalOutput.textContent += `\n📝 Сгенерирован Lua скрипт:\n\n`;
+            terminalOutput.textContent += generatedScript;
+            
+            copyBtn.classList.remove('hidden');
 
             checkBtn.disabled = false;
             checkBtn.innerHTML = '<i class="fas fa-magnifying-glass"></i> Скачать';
+        }
+
+        // Копирование в буфер обмена
+        copyBtn.addEventListener('click', function() {
+            if (!generatedScript) return;
+            
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(generatedScript).then(() => {
+                    copyBtn.innerHTML = '<i class="fas fa-check"></i> Скопировано!';
+                    copyBtn.classList.add('copied');
+                    setTimeout(() => {
+                        copyBtn.innerHTML = '<i class="fas fa-copy"></i> Копировать';
+                        copyBtn.classList.remove('copied');
+                    }, 2000);
+                }).catch(() => {
+                    fallbackCopy();
+                });
+            } else {
+                fallbackCopy();
+            }
+        });
+
+        function fallbackCopy() {
+            const textarea = document.createElement('textarea');
+            textarea.value = generatedScript;
+            textarea.style.position = 'fixed';
+            textarea.style.left = '-9999px';
+            document.body.appendChild(textarea);
+            textarea.select();
+            try {
+                document.execCommand('copy');
+                copyBtn.innerHTML = '<i class="fas fa-check"></i> Скопировано!';
+                copyBtn.classList.add('copied');
+                setTimeout(() => {
+                    copyBtn.innerHTML = '<i class="fas fa-copy"></i> Копировать';
+                    copyBtn.classList.remove('copied');
+                }, 2000);
+            } catch (err) {
+                alert('Не удалось скопировать текст. Скопируйте вручную.');
+            }
+            document.body.removeChild(textarea);
         }
 
         checkBtn.addEventListener('click', function(e) {
