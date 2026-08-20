@@ -1,3 +1,14 @@
+<p align="center">
+  <img src="https://img.shields.io/github/v/release/rodekplay/SteamLuaTools?style=flat-square&label=Версия&color=blue">
+  <img src="https://img.shields.io/github/release-date/rodekplay/SteamLuaTools?style=flat-square&label=Дата&color=blue">
+  <img src="https://img.shields.io/github/downloads/rodekplay/SteamLuaTools/latest/total?style=flat-square&label=Скачиваний&color=success">
+  <img src="https://img.shields.io/github/stars/rodekplay/SteamLuaTools?style=flat-square&label=Stars&color=yellow">
+  <img src="https://img.shields.io/github/forks/rodekplay/SteamLuaTools?style=flat-square&label=Forks&color=orange">
+  <img src="https://img.shields.io/github/watchers/rodekplay/SteamLuaTools?style=flat-square&label=Watchers&color=blueviolet">
+  <img src="https://img.shields.io/github/license/rodekplay/SteamLuaTools?style=flat-square&label=Лицензия&color=lightgrey">
+</p>
+
+
 # SteamLuaTools
 
 ## 📌 О программе
