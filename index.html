@@ -1,442 +1,463 @@
-<!DOCTYPE html>
-<html lang="ru">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
-    <title>Steam AppID Finder & Downloader</title>
-    <style>
-        * {
-            box-sizing: border-box;
-            margin: 0;
-            padding: 0;
-        }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-            background: #1b2838;
-            color: #c7d5e0;
-            display: flex;
-            justify-content: center;
-            align-items: flex-start;
-            min-height: 100vh;
-            padding: 20px 10px;
-        }
-        .app-container {
-            max-width: 800px;
-            width: 100%;
-            background: #2a3d5c;
-            padding: 25px 20px;
-            border-radius: 12px;
-            box-shadow: 0 8px 30px rgba(0, 0, 0, 0.7);
-            border: 1px solid #4b6b8a;
-            margin-top: 20px;
-        }
-        h1 {
-            color: #fff;
-            font-size: 28px;
-            font-weight: 500;
-            text-align: center;
-            margin-bottom: 20px;
-            letter-spacing: 0.5px;
-        }
-        h1 small {
-            font-size: 14px;
-            color: #8ba3c1;
-            display: block;
-            font-weight: 400;
-            margin-top: 5px;
-        }
-        .search-area {
-            display: flex;
-            flex-direction: column;
-            gap: 12px;
-            margin-bottom: 25px;
-        }
-        .search-box-wrapper {
-            display: flex;
-            align-items: center;
-            background: #1b2838;
-            border-radius: 6px;
-            border: 1px solid #4b6b8a;
-            overflow: hidden;
-            transition: border 0.2s;
-        }
-        .search-box-wrapper:focus-within {
-            border-color: #66c0f4;
-            box-shadow: 0 0 0 2px rgba(102, 192, 244, 0.3);
-        }
-        #searchInput {
-            flex: 1;
-            background: transparent;
-            border: none;
-            padding: 14px 16px;
-            font-size: 18px;
-            color: #fff;
-            outline: none;
-            min-width: 0;
-        }
-        #searchInput::placeholder {
-            color: #6b86a3;
-            font-size: 16px;
-        }
-        .search-btn {
-            background: #66c0f4;
-            border: none;
-            color: #1b2838;
-            font-weight: 700;
-            padding: 14px 22px;
-            cursor: pointer;
-            font-size: 18px;
-            transition: background 0.2s;
-            white-space: nowrap;
-            border-left: 1px solid #4b6b8a;
-        }
-        .search-btn:hover {
-            background: #8cd3ff;
-        }
-        .search-btn:active {
-            background: #4fa3d3;
-        }
-        #downloadBtn {
-            background: #5c7e9e;
-            border: 1px solid #4b6b8a;
-            color: #fff;
-            padding: 14px 18px;
-            border-radius: 6px;
-            font-size: 18px;
-            font-weight: 600;
-            cursor: pointer;
-            transition: background 0.2s, border 0.2s;
-            width: 100%;
-            text-align: center;
-        }
-        #downloadBtn:hover {
-            background: #6b8db0;
-            border-color: #66c0f4;
-        }
-        #downloadBtn:active {
-            background: #4a6b8a;
-        }
-        .results-area {
-            background: #1b2838;
-            border-radius: 8px;
-            padding: 5px 0;
-            max-height: 500px;
-            overflow-y: auto;
-            border: 1px solid #4b6b8a;
-            margin-top: 5px;
-        }
-        .result-item {
-            padding: 12px 16px;
-            border-bottom: 1px solid #2a3d5c;
-            cursor: pointer;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            transition: background 0.15s;
-            color: #c7d5e0;
-        }
-        .result-item:last-child {
-            border-bottom: none;
-        }
-        .result-item:hover {
-            background: #2f4b6e;
-        }
-        .result-item .app-id {
-            color: #8ba3c1;
-            font-size: 14px;
-            font-weight: 400;
-            background: #2a3d5c;
-            padding: 3px 10px;
-            border-radius: 20px;
-            margin-left: 10px;
-            white-space: nowrap;
-        }
-        .result-item .app-name {
-            font-weight: 500;
-            word-break: break-word;
-            margin-right: 8px;
-        }
-        .status-message {
-            text-align: center;
-            color: #8ba3c1;
-            padding: 20px 10px;
-            font-size: 16px;
-        }
-        .status-message.error {
-            color: #ff6f6f;
-        }
-        .status-message.success {
-            color: #8bc34a;
-        }
-        .loading-message {
-            text-align: center;
-            color: #66c0f4;
-            padding: 20px 10px;
-            font-size: 16px;
-        }
-        .results-area::-webkit-scrollbar {
-            width: 8px;
-        }
-        .results-area::-webkit-scrollbar-track {
-            background: #1b2838;
-        }
-        .results-area::-webkit-scrollbar-thumb {
-            background: #4b6b8a;
-            border-radius: 4px;
-        }
-        .results-area::-webkit-scrollbar-thumb:hover {
-            background: #66c0f4;
-        }
-        @media (max-width: 600px) {
-            .app-container { padding: 15px 12px; }
-            h1 { font-size: 22px; }
-            #searchInput { font-size: 16px; padding: 12px 14px; }
-            .search-btn { font-size: 16px; padding: 12px 16px; }
-            #downloadBtn { font-size: 16px; padding: 12px 16px; }
-            .result-item { padding: 10px 12px; flex-wrap: wrap; }
-            .result-item .app-id { font-size: 12px; margin-left: 0; margin-top: 4px; }
-        }
-    </style>
-</head>
-<body>
-<div class="app-container">
-    <h1>
-        🎮 Steam AppID Finder
-        <small>Поиск по названию игры или AppID</small>
-    </h1>
+<!DOCTYPE html>  
+<html lang="ru">  
+<head>  
+    <meta charset="UTF-8" />  
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />  
+    <title>Генератор Manifest для SteamLuaTools</title>  
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css" />  
+    <style>  
+        * {  
+            margin: 0;  
+            padding: 0;  
+            box-sizing: border-box;  
+        }  
+        body {  
+            min-height: 100vh;  
+            display: flex;  
+            align-items: center;  
+            justify-content: center;  
+            font-family: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;  
+            background: linear-gradient(145deg, #2c2f33 0%, #23272a 100%);  
+            padding: 20px;  
+        }  
+        .glass-card {  
+            max-width: 700px;  
+            width: 100%;  
+            background: rgba(44, 47, 51, 0.7);  
+            backdrop-filter: blur(8px);  
+            -webkit-backdrop-filter: blur(8px);  
+            border-radius: 48px;  
+            padding: 40px 32px;  
+            box-shadow: 0 25px 40px -10px rgba(0, 0, 0, 0.7), inset 0 1px 2px rgba(255, 255, 255, 0.06);  
+            border: 1px solid rgba(255, 255, 255, 0.03);  
+        }  
+        .title {  
+            text-align: center;  
+            font-weight: 600;  
+            font-size: 1.8rem;  
+            letter-spacing: -0.02em;  
+            color: #f0f2f5;  
+            margin-bottom: 8px;  
+        }  
+        .title span {  
+            background: linear-gradient(135deg, #b7bdc6, #d1d7e0);  
+            -webkit-background-clip: text;  
+            -webkit-text-fill-color: transparent;  
+            background-clip: text;  
+        }  
+        .sub-head {  
+            text-align: center;  
+            font-size: 0.95rem;  
+            color: #8e9297;  
+            margin-bottom: 32px;  
+            border-bottom: 1px solid rgba(255, 255, 255, 0.04);  
+            padding-bottom: 18px;  
+        }  
+        .input-group {  
+            display: flex;  
+            flex-direction: column;  
+            gap: 12px;  
+            margin-bottom: 28px;  
+        }  
+        .input-group label {  
+            font-weight: 500;  
+            font-size: 0.9rem;  
+            color: #c4c9ce;  
+            letter-spacing: 0.3px;  
+            display: flex;  
+            align-items: center;  
+            gap: 8px;  
+        }  
+        .input-group label i {  
+            color: #6c8cff;  
+            font-size: 1rem;  
+        }  
+        .input-row {  
+            display: flex;  
+            gap: 12px;  
+            flex-wrap: wrap;  
+        }  
+        .input-row input {  
+            flex: 2;  
+            min-width: 180px;  
+            background: #2f3136;  
+            border: 1px solid #40444b;  
+            border-radius: 40px;  
+            padding: 14px 22px;  
+            font-size: 1rem;  
+            color: #f0f2f5;  
+            outline: none;  
+            transition: 0.2s;  
+            font-weight: 450;  
+        }  
+        .input-row input:focus {  
+            border-color: #6c8cff;  
+            background: #35393f;  
+            box-shadow: 0 0 0 3px rgba(108, 140, 255, 0.15);  
+        }  
+        .input-row input::placeholder {  
+            color: #6a6f78;  
+            font-weight: 400;  
+        }  
+        .btn-primary {  
+            flex: 0 0 auto;  
+            background: #5865f2;  
+            border: none;  
+            border-radius: 40px;  
+            padding: 14px 32px;  
+            font-weight: 600;  
+            font-size: 1rem;  
+            color: white;  
+            cursor: pointer;  
+            display: inline-flex;  
+            align-items: center;  
+            justify-content: center;  
+            gap: 10px;  
+            transition: 0.2s;  
+            box-shadow: 0 4px 12px rgba(88, 101, 242, 0.3);  
+            letter-spacing: 0.3px;  
+            white-space: nowrap;  
+        }  
+        .btn-primary:hover {  
+            background: #4752c4;  
+            transform: scale(1.02);  
+            box-shadow: 0 6px 16px rgba(88, 101, 242, 0.4);  
+        }  
+        .btn-primary:active {  
+            transform: scale(0.97);  
+        }  
+        .btn-primary:disabled {  
+            opacity: 0.7;  
+            cursor: default;  
+            transform: none;  
+            box-shadow: none;  
+        }  
+        #resultsSection {  
+            margin-top: 20px;  
+            background: rgba(0, 0, 0, 0.25);  
+            border-radius: 28px;  
+            padding: 18px 20px;  
+            backdrop-filter: blur(4px);  
+            border: 1px solid rgba(255, 255, 255, 0.02);  
+        }  
+        .terminal {  
+            font-family: 'Fira Code', 'JetBrains Mono', 'Courier New', monospace;  
+            font-size: 0.9rem;  
+            color: #b9bbbe;  
+            background: #1e1f22;  
+            padding: 16px 18px;  
+            border-radius: 20px;  
+            min-height: 70px;  
+            white-space: pre-wrap;  
+            word-break: break-word;  
+            line-height: 1.6;  
+            border-left: 3px solid #5865f2;  
+            box-shadow: inset 0 2px 6px rgba(0,0,0,0.4);  
+        }  
+        .terminal .highlight {  
+            color: #a6c8ff;  
+        }  
+        .action-row {  
+            display: flex;  
+            flex-wrap: wrap;  
+            align-items: center;  
+            justify-content: flex-end;  
+            gap: 12px;  
+            margin-top: 6px;  
+            min-height: 10px;  
+        }  
+        .notfound-badge {  
+            background: #da373c20;  
+            border: 1px solid #da373c60;  
+            border-radius: 40px;  
+            padding: 8px 20px;  
+            color: #f6a8ab;  
+            font-weight: 500;  
+            font-size: 0.9rem;  
+            display: inline-flex;  
+            align-items: center;  
+            gap: 8px;  
+        }  
+        .hidden {  
+            display: none !important;  
+        }  
+        .footer-links {  
+            display: flex;  
+            justify-content: center;  
+            gap: 24px;  
+            margin-top: 36px;  
+            flex-wrap: wrap;  
+        }  
+        .footer-btn {  
+            display: inline-flex;  
+            align-items: center;  
+            gap: 12px;  
+            background: rgba(255, 255, 255, 0.04);  
+            backdrop-filter: blur(4px);  
+            border: 1px solid rgba(255, 255, 255, 0.06);  
+            padding: 12px 28px;  
+            border-radius: 60px;  
+            color: #d1d7e0;  
+            font-weight: 500;  
+            font-size: 1rem;  
+            text-decoration: none;  
+            transition: 0.25s;  
+            box-shadow: 0 6px 12px rgba(0, 0, 0, 0.2);  
+            letter-spacing: 0.2px;  
+        }  
+        .footer-btn i {  
+            font-size: 1.3rem;  
+        }  
+        .footer-btn.github:hover {  
+            background: #2b3137;  
+            border-color: #8b949e;  
+            color: white;  
+            transform: translateY(-2px);  
+        }  
+        .footer-btn.discord:hover {  
+            background: #404eed;  
+            border-color: #7983f5;  
+            color: white;  
+            transform: translateY(-2px);  
+        }  
+        @media (max-width: 550px) {  
+            .glass-card { padding: 28px 18px; }  
+            .title { font-size: 1.5rem; }  
+            .input-row { flex-direction: column; }  
+            .input-row input { width: 100%; }  
+            .btn-primary { width: 100%; justify-content: center; }  
+            .footer-links { flex-direction: column; align-items: center; }  
+            .footer-btn { width: 100%; justify-content: center; }  
+        }  
+        .spinner {  
+            display: inline-block;  
+            width: 18px;  
+            height: 18px;  
+            border: 2px solid rgba(255,255,255,0.2);  
+            border-top: 2px solid white;  
+            border-radius: 50%;  
+            animation: spin 0.7s linear infinite;  
+        }  
+        @keyframes spin {  
+            0% { transform: rotate(0deg); }  
+            100% { transform: rotate(360deg); }  
+        }  
+    </style>  
+</head>  
+<body>  
+<div class="glass-card">  
+    <div class="title">  
+        <span>Генератор «Manifest»</span>  
+    </div>  
+    <div class="sub-head">  
+        для SteamLuaTools  
+    </div>  
 
-    <div class="search-area">
-        <div class="search-box-wrapper">
-            <input type="text" id="searchInput" placeholder="Например: Team Fortress 2 или 440..." autofocus>
-            <button class="search-btn" id="searchBtn">🔍 Найти</button>
-        </div>
-        <button id="downloadBtn">⬇️ Скачать выбранную игру</button>
-    </div>
+    <div class="input-group">  
+        <label for="gameId"><i class="fas fa-hashtag"></i> Введите AppID или название игры</label>  
+        <div class="input-row">  
+            <input type="text" id="gameId" placeholder="Например, Team Fortress 2, 440" />  
+            <button id="checkBtn" class="btn-primary">  
+                <i class="fas fa-magnifying-glass"></i> Скачать  
+            </button>  
+        </div>  
+    </div>  
 
-    <div class="results-area" id="resultsContainer">
-        <div class="loading-message">⏳ Загрузка списка игр...</div>
-    </div>
-</div>
+    <div id="resultsSection" class="hidden">  
+        <div class="terminal" id="terminalOutput"></div>  
+        <div class="action-row">  
+            <div id="notFoundSection" class="hidden">  
+                <span class="notfound-badge"><i class="fas fa-circle-exclamation"></i> Манифест не найден</span>  
+            </div>  
+        </div>  
+    </div>  
 
-<script>
-    // --- Глобальные переменные ---
-    let allGames = []; // Сюда загрузим все игры из JSON
-    let currentAppId = null; // ID выбранной игры
+    <div class="footer-links">  
+        <a href="https://github.com/rodekplay" target="_blank" class="footer-btn github">  
+            <i class="fab fa-github"></i> GitHub  
+        </a>  
+        <a href="https://rodekplay.github.io/cs-news.github.io/" target="_blank" class="footer-btn discord">  
+            <i class="fab fa-discord"></i> Discord сервер  
+        </a>  
+    </div>  
+</div>  
 
-    // --- DOM элементы ---
-    const searchInput = document.getElementById('searchInput');
-    const searchBtn = document.getElementById('searchBtn');
-    const downloadBtn = document.getElementById('downloadBtn');
-    const resultsContainer = document.getElementById('resultsContainer');
+<script>  
+    (function() {  
+        "use strict";  
 
-    // --- Загрузка данных из файла steamname.json ---
-    async function loadGameData() {
-        try {
-            const response = await fetch('steamname.json');
-            if (!response.ok) {
-                throw new Error(`HTTP error! status: ${response.status}`);
-            }
-            const data = await response.json();
-            // Проверяем структуру — у тебя data = { applist: { apps: [...] } }
-            if (data && data.applist && Array.isArray(data.applist.apps)) {
-                allGames = data.applist.apps;
-                showStatus(`✅ Загружено ${allGames.length} игр. Введите запрос для поиска.`);
-            } else {
-                throw new Error('Неверная структура файла steamname.json');
-            }
-        } catch (error) {
-            console.error('Ошибка загрузки данных:', error);
-            showStatus('❌ Не удалось загрузить список игр. Проверьте, что файл steamname.json находится рядом с index.html.', 'error');
-            // Для теста, если файл не найден, можно использовать пустой массив или встроенные данные
-            // allGames = []; // Раскомментировать, если нужно
-        }
-    }
+        let gameDatabase = []; // Будет заполнено из JSON  
 
-    // --- Функция для отображения статуса ---
-    function showStatus(message, type = 'info') {
-        resultsContainer.innerHTML = `<div class="status-message ${type}">${message}</div>`;
-    }
+        const gameIdInput = document.getElementById('gameId');  
+        const checkBtn = document.getElementById('checkBtn');  
+        const resultsSection = document.getElementById('resultsSection');  
+        const terminalOutput = document.getElementById('terminalOutput');  
+        const notFoundSection = document.getElementById('notFoundSection');  
 
-    // --- Основная функция поиска ---
-    function performSearch() {
-        const query = searchInput.value.trim().toLowerCase();
+        resultsSection.classList.add('hidden');  
 
-        // Если поле пустое — показываем подсказку
-        if (!query) {
-            showStatus('Введите название игры или AppID для поиска');
-            currentAppId = null;
-            return;
-        }
+        // --- ЗАГРУЗКА ДАННЫХ ИЗ ФАЙЛА ---  
+        async function loadGameDatabase() {  
+            try {  
+                const response = await fetch('steamname.json');  
+                if (!response.ok) throw new Error('Файл не найден');  
+                const data = await response.json();  
+                if (data && data.applist && Array.isArray(data.applist.apps)) {  
+                    gameDatabase = data.applist.apps;  
+                    console.log(`✅ Загружено ${gameDatabase.length} игр`);  
+                }  
+            } catch (error) {  
+                console.error('Ошибка загрузки базы игр:', error);  
+                // Если файл не загрузился — оставляем пустую базу  
+            }  
+        }  
 
-        // Если запрос — это число, ищем по ID
-        if (/^\d+$/.test(query)) {
-            const id = parseInt(query, 10);
-            const found = allGames.find(game => game.appid === id);
-            if (found) {
-                // Нашли игру по ID
-                resultsContainer.innerHTML = `
-                    <div class="result-item" onclick="selectGame('${found.appid}', '${found.name.replace(/'/g, "\\'")}')">
-                        <span class="app-name">${found.name}</span>
-                        <span class="app-id">ID: ${found.appid}</span>
-                    </div>
-                `;
-                // Автоматически выбираем эту игру
-                selectGame(found.appid, found.name);
-                return;
-            } else {
-                showStatus(`❌ Игра с ID "${query}" не найдена.`, 'error');
-                currentAppId = null;
-                return;
-            }
-        }
+        // --- ПОИСК ID ПО НАЗВАНИЮ ---  
+        function findAppIdByName(query) {  
+            const lowerQuery = query.toLowerCase().trim();  
+            const words = lowerQuery.split(/\s+/).filter(w => w.length > 0);  
 
-        // --- Поиск по названию (по словам) ---
-        const queryWords = query.split(/\s+/).filter(word => word.length > 0);
+            // Ищем по всем словам (AND)  
+            const results = gameDatabase.filter(game => {  
+                const nameLower = game.name.toLowerCase();  
+                return words.every(word => nameLower.includes(word));  
+            });  
 
-        const results = allGames.filter(game => {
-            const nameLower = game.name.toLowerCase();
-            // Проверяем, что каждое слово из запроса присутствует в названии
-            return queryWords.every(word => nameLower.includes(word));
-        });
+            // Если нашлась ровно одна игра — возвращаем её ID  
+            if (results.length === 1) {  
+                return String(results[0].appid);  
+            }  
 
-        // Ограничиваем вывод первыми 50 результатами для производительности
-        const displayResults = results.slice(0, 50);
+            // Если нашлось несколько — показываем все в консоли, но берём первый  
+            if (results.length > 1) {  
+                console.log(`Найдено несколько игр:`, results.map(g => `${g.name} (${g.appid})`).join(', '));  
+                return String(results[0].appid);  
+            }  
 
-        if (displayResults.length === 0) {
-            showStatus(`❌ По запросу "${query}" ничего не найдено.`, 'error');
-            currentAppId = null;
-            return;
-        }
+            return null;  
+        }  
 
-        // Если только один результат — сразу его выбираем
-        if (displayResults.length === 1) {
-            const game = displayResults[0];
-            resultsContainer.innerHTML = `
-                <div class="result-item" onclick="selectGame('${game.appid}', '${game.name.replace(/'/g, "\\'")}')">
-                    <span class="app-name">${game.name}</span>
-                    <span class="app-id">ID: ${game.appid}</span>
-                </div>
-            `;
-            selectGame(game.appid, game.name);
-            return;
-        }
+        function resetUI() {  
+            notFoundSection.classList.add('hidden');  
+            terminalOutput.textContent = '';  
+            checkBtn.disabled = false;  
+            checkBtn.innerHTML = '<i class="fas fa-magnifying-glass"></i> Скачать';  
+        }  
 
-        // --- Показываем все найденные результаты ---
-        let html = '';
-        displayResults.forEach(game => {
-            // Экранируем кавычки для onclick
-            const safeName = game.name.replace(/'/g, "\\'");
-            html += `
-                <div class="result-item" onclick="selectGame('${game.appid}', '${safeName}')">
-                    <span class="app-name">${game.name}</span>
-                    <span class="app-id">ID: ${game.appid}</span>
-                </div>
-            `;
-        });
+        function typeText(text, callback) {  
+            let index = 0;  
+            terminalOutput.textContent = '';  
+            function tick() {  
+                if (index < text.length) {  
+                    terminalOutput.textContent += text.charAt(index);  
+                    index++;  
+                    setTimeout(tick, 18);  
+                } else {  
+                    if (callback) callback();  
+                }  
+            }  
+            tick();  
+        }  
 
-        // Добавляем информацию о количестве найденных игр
-        const totalFound = results.length;
-        let infoText = `Найдено: ${totalFound}`;
-        if (totalFound > 50) {
-            infoText += ` (показаны первые 50)`;
-        }
-        resultsContainer.innerHTML = `
-            <div style="padding: 8px 16px; color: #8ba3c1; font-size: 14px; border-bottom: 1px solid #2a3d5c;">${infoText}</div>
-            ${html}
-        `;
+        function triggerDownload(url, filename) {  
+            const a = document.createElement('a');  
+            a.href = url;  
+            a.download = filename;  
+            document.body.appendChild(a);  
+            a.click();  
+            document.body.removeChild(a);  
+        }  
 
-        // Сбрасываем текущий выбранный ID, так как пользователь ещё не кликнул
-        currentAppId = null;
-    }
+        async function checkManifest() {  
+            let rawInput = gameIdInput.value.trim();  
 
-    // --- Функция выбора игры (вызывается по клику на результат) ---
-    function selectGame(appid, name) {
-        currentAppId = appid;
-        // Вставляем ID в поле поиска
-        searchInput.value = appid;
-        // Подсвечиваем выбранный элемент в списке (опционально)
-        const items = document.querySelectorAll('.result-item');
-        items.forEach(item => {
-            item.style.background = '';
-        });
-        // Находим и подсвечиваем выбранный элемент (если он есть в DOM)
-        const selectedItem = Array.from(items).find(item => {
-            return item.textContent.includes(String(appid));
-        });
-        if (selectedItem) {
-            selectedItem.style.background = '#2f4b6e';
-            selectedItem.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-        }
+            if (!rawInput) {  
+                resultsSection.classList.remove('hidden');  
+                notFoundSection.classList.add('hidden');  
+                typeText('⚠️ Ошибка: введите AppID или название игры.');  
+                return;  
+            }  
 
-        // АВТОМАТИЧЕСКИ НАЖИМАЕМ КНОПКУ "СКАЧАТЬ"
-        downloadGame();
-    }
+            // --- ЕСЛИ ВВЕДЕНО НЕ ЧИСЛО — ИЩЕМ ПО НАЗВАНИЮ ---  
+            let gameId = rawInput;  
+            if (!/^\d+$/.test(rawInput)) {  
+                const foundId = findAppIdByName(rawInput);  
+                if (foundId) {  
+                    gameId = foundId;  
+                    gameIdInput.value = foundId;  
+                } else {  
+                    resultsSection.classList.remove('hidden');  
+                    notFoundSection.classList.add('hidden');  
+                    typeText(`❌ Игра "${rawInput}" не найдена в базе.\nПопробуйте ввести AppID напрямую.`);  
+                    return;  
+                }  
+            }  
 
-    // --- Функция скачивания игры ---
-    function downloadGame() {
-        if (currentAppId === null) {
-            alert('❌ Сначала выберите игру из списка или введите корректный AppID.');
-            return;
-        }
+            // --- ДАЛЬШЕ ОРИГИНАЛЬНЫЙ КОД ---  
+            checkBtn.disabled = true;  
+            checkBtn.innerHTML = '<span class="spinner"></span> Поиск...';  
 
-        const appid = currentAppId;
-        // Ищем название игры для информативности
-        const game = allGames.find(g => g.appid === appid);
-        const gameName = game ? game.name : `AppID ${appid}`;
+            resultsSection.classList.remove('hidden');  
+            notFoundSection.classList.add('hidden');  
 
-        // Формируем ссылку для открытия в Steam
-        const steamUrl = `steam://openurl/https://store.steampowered.com/app/${appid}/`;
+            const startMsg = `🔍 Проверка манифеста для AppID: ${gameId}\n📡 Запрос к базе...\n`;  
+            await new Promise((resolve) => {  
+                typeText(startMsg, resolve);  
+            });  
 
-        // Пытаемся открыть ссылку
-        const result = window.open(steamUrl, '_blank');
+            try {  
+                const response = await fetch(`https://api.github.com/repos/SPIN0ZAi/SB_manifest_DB/branches/${gameId}`, {  
+                    headers: { 'Accept': 'application/vnd.github.v3+json' }  
+                });  
 
-        // Если window.open вернул null или undefined — показываем сообщение
-        if (!result) {
-            alert(`⚠️ Не удалось открыть ссылку. Возможно, ваш браузер блокирует всплывающие окна.\n\nПопробуйте скопировать ссылку вручную:\n${steamUrl}`);
-        } else {
-            // Если всё ок, показываем уведомление (не навязчиво)
-            showStatus(`✅ Открываем в Steam: ${gameName} (ID: ${appid})`, 'success');
-            // Через 3 секунды возвращаем обычный статус
-            setTimeout(() => {
-                if (searchInput.value.trim()) {
-                    performSearch();
-                } else {
-                    showStatus('Введите запрос для поиска');
-                }
-            }, 3000);
-        }
-    }
+                if (response.status === 200) {  
+                    const foundMsg = `✅ Манифест найден!\n📦 Подготовка ссылки...\n`;  
+                    await new Promise((resolve) => {  
+                        typeText(foundMsg, resolve);  
+                    });  
 
-    // --- Обработчики событий ---
+                    const zipUrl = `https://codeload.github.com/SPIN0ZAi/SB_manifest_DB/zip/refs/heads/${gameId}`;  
+                    terminalOutput.textContent += `✔ Готово.`;  
+                    triggerDownload(zipUrl);  
 
-    // Кнопка "Найти"
-    searchBtn.addEventListener('click', performSearch);
+                } else {  
+                    const notFoundMsg = `❌ Манифест для AppID ${gameId} не найден в базе.\nПопробуйте другой ID.`;  
+                    await new Promise((resolve) => {  
+                        typeText(notFoundMsg, resolve);  
+                    });  
+                    notFoundSection.classList.remove('hidden');  
+                }  
+            } catch (err) {  
+                const errorMsg = `⚠️ Ошибка соединения. Проверьте интернет и повторите.\n${err.message || ''}`;  
+                await new Promise((resolve) => {  
+                    typeText(errorMsg, resolve);  
+                });  
+                notFoundSection.classList.add('hidden');  
+            } finally {  
+                checkBtn.disabled = false;  
+                checkBtn.innerHTML = '<i class="fas fa-magnifying-glass"></i> Скачать';  
+            }  
+        }  
 
-    // Поиск при нажатии Enter
-    searchInput.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') {
-            e.preventDefault();
-            performSearch();
-        }
-    });
+        // --- ЗАГРУЖАЕМ БАЗУ ПРИ СТАРТЕ ---  
+        loadGameDatabase();  
 
-    // Кнопка "Скачать"
-    downloadBtn.addEventListener('click', downloadGame);
+        checkBtn.addEventListener('click', function(e) {  
+            e.preventDefault();  
+            resetUI();  
+            checkManifest();  
+        });  
 
-    // Автопоиск при вводе (с задержкой для удобства)
-    let searchTimeout = null;
-    searchInput.addEventListener('input', () => {
-        clearTimeout(searchTimeout);
-        searchTimeout = setTimeout(() => {
-            performSearch();
-        }, 300); // задержка 300 мс
-    });
+        gameIdInput.addEventListener('keypress', function(e) {  
+            if (e.key === 'Enter') {  
+                e.preventDefault();  
+                resetUI();  
+                checkManifest();  
+            }  
+        });  
 
-    // --- Загрузка данных при старте ---
-    loadGameData();
-
-    // Делаем функцию selectGame доступной глобально для onclick в HTML
-    window.selectGame = selectGame;
-</script>
-</body>
+        console.log('Генератор Manifest для SteamLuaTools — загружает данные из steamname.json');  
+    })();  
+</script>  
+</body>  
 </html>
