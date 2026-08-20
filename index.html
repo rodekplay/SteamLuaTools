@@ -312,14 +312,14 @@
             tick();  
         }  
   
-        function triggerDownload(url) {  
+        function triggerDownload(url, filename) {  
             const a = document.createElement('a');  
             a.href = url;  
-            a.download = '';  
+            a.download = filename;  
             document.body.appendChild(a);  
             a.click();  
             document.body.removeChild(a);  
-        }  
+        }
   
         async function checkManifest() {  
             const gameId = gameIdInput.value.trim();  
