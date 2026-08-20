@@ -1,11 +1,9 @@
-<p align="center">
-  <img src="https://img.shields.io/github/v/release/rodekplay/SteamLuaTools?style=flat-square&label=Версия&color=blue">
-  <img src="https://img.shields.io/github/release-date/rodekplay/SteamLuaTools?style=flat-square&label=Дата&color=blue">
-  <img src="https://img.shields.io/github/downloads/rodekplay/SteamLuaTools/latest/total?style=flat-square&label=Скачиваний&color=success">
-  <img src="https://img.shields.io/github/stars/rodekplay/SteamLuaTools?style=flat-square&label=Stars&color=yellow">
-  <img src="https://img.shields.io/github/forks/rodekplay/SteamLuaTools?style=flat-square&label=Forks&color=orange">
-  <img src="https://img.shields.io/github/watchers/rodekplay/SteamLuaTools?style=flat-square&label=Watchers&color=blueviolet">
-  <img src="https://img.shields.io/github/license/rodekplay/SteamLuaTools?style=flat-square&label=Лицензия&color=lightgrey">
+<p align="left">
+  <img src="https://img.shields.io/badge/версия-7.0-blue?style=flat">
+  <img src="https://img.shields.io/badge/дата-2026.08.20-blue?style=flat">
+  <img src="https://img.shields.io/badge/скачивания-1.5k-brightgreen?style=flat">
+  <img src="https://img.shields.io/badge/stars-26-yellow?style=flat">
+  <img src="https://img.shields.io/badge/forks-5-orange?style=flat">
 </p>
 
 
