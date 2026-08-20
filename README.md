@@ -1,9 +1,9 @@
 <p align="left">
-  <img src="https://img.shields.io/badge/версия-7.0-blue?style=flat">
-  <img src="https://img.shields.io/badge/дата-2026.08.20-blue?style=flat">
-  <img src="https://img.shields.io/badge/скачивания-1.5k-brightgreen?style=flat">
-  <img src="https://img.shields.io/badge/stars-26-yellow?style=flat">
-  <img src="https://img.shields.io/badge/forks-5-orange?style=flat">
+  <img src="https://img.shields.io/badge/Версия-7.0-blue?style=plastic">
+  <img src="https://img.shields.io/badge/Дата-2026.08.20-blue?style=plastic">
+  <img src="https://img.shields.io/badge/Скачивания-1.5k-brightgreen?style=plastic">
+  <img src="https://img.shields.io/github/stars/rodekplay/SteamLuaTools?style=plastic&label=Stars&color=yellow">
+  <img src="https://img.shields.io/github/forks/rodekplay/SteamLuaTools?style=plastic&label=Forks&color=orange">
 </p>
 
 
