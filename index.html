@@ -1,463 +1,560 @@
-<!DOCTYPE html>  
-<html lang="ru">  
-<head>  
-    <meta charset="UTF-8" />  
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />  
-    <title>Генератор Manifest для SteamLuaTools</title>  
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css" />  
-    <style>  
-        * {  
-            margin: 0;  
-            padding: 0;  
-            box-sizing: border-box;  
-        }  
-        body {  
-            min-height: 100vh;  
-            display: flex;  
-            align-items: center;  
-            justify-content: center;  
-            font-family: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;  
-            background: linear-gradient(145deg, #2c2f33 0%, #23272a 100%);  
-            padding: 20px;  
-        }  
-        .glass-card {  
-            max-width: 700px;  
-            width: 100%;  
-            background: rgba(44, 47, 51, 0.7);  
-            backdrop-filter: blur(8px);  
-            -webkit-backdrop-filter: blur(8px);  
-            border-radius: 48px;  
-            padding: 40px 32px;  
-            box-shadow: 0 25px 40px -10px rgba(0, 0, 0, 0.7), inset 0 1px 2px rgba(255, 255, 255, 0.06);  
-            border: 1px solid rgba(255, 255, 255, 0.03);  
-        }  
-        .title {  
-            text-align: center;  
-            font-weight: 600;  
-            font-size: 1.8rem;  
-            letter-spacing: -0.02em;  
-            color: #f0f2f5;  
-            margin-bottom: 8px;  
-        }  
-        .title span {  
-            background: linear-gradient(135deg, #b7bdc6, #d1d7e0);  
-            -webkit-background-clip: text;  
-            -webkit-text-fill-color: transparent;  
-            background-clip: text;  
-        }  
-        .sub-head {  
-            text-align: center;  
-            font-size: 0.95rem;  
-            color: #8e9297;  
-            margin-bottom: 32px;  
-            border-bottom: 1px solid rgba(255, 255, 255, 0.04);  
-            padding-bottom: 18px;  
-        }  
-        .input-group {  
-            display: flex;  
-            flex-direction: column;  
-            gap: 12px;  
-            margin-bottom: 28px;  
-        }  
-        .input-group label {  
-            font-weight: 500;  
-            font-size: 0.9rem;  
-            color: #c4c9ce;  
-            letter-spacing: 0.3px;  
-            display: flex;  
-            align-items: center;  
-            gap: 8px;  
-        }  
-        .input-group label i {  
-            color: #6c8cff;  
-            font-size: 1rem;  
-        }  
-        .input-row {  
-            display: flex;  
-            gap: 12px;  
-            flex-wrap: wrap;  
-        }  
-        .input-row input {  
-            flex: 2;  
-            min-width: 180px;  
-            background: #2f3136;  
-            border: 1px solid #40444b;  
-            border-radius: 40px;  
-            padding: 14px 22px;  
-            font-size: 1rem;  
-            color: #f0f2f5;  
-            outline: none;  
-            transition: 0.2s;  
-            font-weight: 450;  
-        }  
-        .input-row input:focus {  
-            border-color: #6c8cff;  
-            background: #35393f;  
-            box-shadow: 0 0 0 3px rgba(108, 140, 255, 0.15);  
-        }  
-        .input-row input::placeholder {  
-            color: #6a6f78;  
-            font-weight: 400;  
-        }  
-        .btn-primary {  
-            flex: 0 0 auto;  
-            background: #5865f2;  
-            border: none;  
-            border-radius: 40px;  
-            padding: 14px 32px;  
-            font-weight: 600;  
-            font-size: 1rem;  
-            color: white;  
-            cursor: pointer;  
-            display: inline-flex;  
-            align-items: center;  
-            justify-content: center;  
-            gap: 10px;  
-            transition: 0.2s;  
-            box-shadow: 0 4px 12px rgba(88, 101, 242, 0.3);  
-            letter-spacing: 0.3px;  
-            white-space: nowrap;  
-        }  
-        .btn-primary:hover {  
-            background: #4752c4;  
-            transform: scale(1.02);  
-            box-shadow: 0 6px 16px rgba(88, 101, 242, 0.4);  
-        }  
-        .btn-primary:active {  
-            transform: scale(0.97);  
-        }  
-        .btn-primary:disabled {  
-            opacity: 0.7;  
-            cursor: default;  
-            transform: none;  
-            box-shadow: none;  
-        }  
-        #resultsSection {  
-            margin-top: 20px;  
-            background: rgba(0, 0, 0, 0.25);  
-            border-radius: 28px;  
-            padding: 18px 20px;  
-            backdrop-filter: blur(4px);  
-            border: 1px solid rgba(255, 255, 255, 0.02);  
-        }  
-        .terminal {  
-            font-family: 'Fira Code', 'JetBrains Mono', 'Courier New', monospace;  
-            font-size: 0.9rem;  
-            color: #b9bbbe;  
-            background: #1e1f22;  
-            padding: 16px 18px;  
-            border-radius: 20px;  
-            min-height: 70px;  
-            white-space: pre-wrap;  
-            word-break: break-word;  
-            line-height: 1.6;  
-            border-left: 3px solid #5865f2;  
-            box-shadow: inset 0 2px 6px rgba(0,0,0,0.4);  
-        }  
-        .terminal .highlight {  
-            color: #a6c8ff;  
-        }  
-        .action-row {  
-            display: flex;  
-            flex-wrap: wrap;  
-            align-items: center;  
-            justify-content: flex-end;  
-            gap: 12px;  
-            margin-top: 6px;  
-            min-height: 10px;  
-        }  
-        .notfound-badge {  
-            background: #da373c20;  
-            border: 1px solid #da373c60;  
-            border-radius: 40px;  
-            padding: 8px 20px;  
-            color: #f6a8ab;  
-            font-weight: 500;  
-            font-size: 0.9rem;  
-            display: inline-flex;  
-            align-items: center;  
-            gap: 8px;  
-        }  
-        .hidden {  
-            display: none !important;  
-        }  
-        .footer-links {  
-            display: flex;  
-            justify-content: center;  
-            gap: 24px;  
-            margin-top: 36px;  
-            flex-wrap: wrap;  
-        }  
-        .footer-btn {  
-            display: inline-flex;  
-            align-items: center;  
-            gap: 12px;  
-            background: rgba(255, 255, 255, 0.04);  
-            backdrop-filter: blur(4px);  
-            border: 1px solid rgba(255, 255, 255, 0.06);  
-            padding: 12px 28px;  
-            border-radius: 60px;  
-            color: #d1d7e0;  
-            font-weight: 500;  
-            font-size: 1rem;  
-            text-decoration: none;  
-            transition: 0.25s;  
-            box-shadow: 0 6px 12px rgba(0, 0, 0, 0.2);  
-            letter-spacing: 0.2px;  
-        }  
-        .footer-btn i {  
-            font-size: 1.3rem;  
-        }  
-        .footer-btn.github:hover {  
-            background: #2b3137;  
-            border-color: #8b949e;  
-            color: white;  
-            transform: translateY(-2px);  
-        }  
-        .footer-btn.discord:hover {  
-            background: #404eed;  
-            border-color: #7983f5;  
-            color: white;  
-            transform: translateY(-2px);  
-        }  
-        @media (max-width: 550px) {  
-            .glass-card { padding: 28px 18px; }  
-            .title { font-size: 1.5rem; }  
-            .input-row { flex-direction: column; }  
-            .input-row input { width: 100%; }  
-            .btn-primary { width: 100%; justify-content: center; }  
-            .footer-links { flex-direction: column; align-items: center; }  
-            .footer-btn { width: 100%; justify-content: center; }  
-        }  
-        .spinner {  
-            display: inline-block;  
-            width: 18px;  
-            height: 18px;  
-            border: 2px solid rgba(255,255,255,0.2);  
-            border-top: 2px solid white;  
-            border-radius: 50%;  
-            animation: spin 0.7s linear infinite;  
-        }  
-        @keyframes spin {  
-            0% { transform: rotate(0deg); }  
-            100% { transform: rotate(360deg); }  
-        }  
-    </style>  
-</head>  
-<body>  
-<div class="glass-card">  
-    <div class="title">  
-        <span>Генератор «Manifest»</span>  
-    </div>  
-    <div class="sub-head">  
-        для SteamLuaTools  
-    </div>  
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Генератор Manifest для SteamLuaTools</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css" />
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-family: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+            background: linear-gradient(145deg, #2c2f33 0%, #23272a 100%);
+            padding: 20px;
+        }
+        .glass-card {
+            max-width: 700px;
+            width: 100%;
+            background: rgba(44, 47, 51, 0.7);
+            backdrop-filter: blur(8px);
+            -webkit-backdrop-filter: blur(8px);
+            border-radius: 48px;
+            padding: 40px 32px;
+            box-shadow: 0 25px 40px -10px rgba(0, 0, 0, 0.7), inset 0 1px 2px rgba(255, 255, 255, 0.06);
+            border: 1px solid rgba(255, 255, 255, 0.03);
+        }
+        .title {
+            text-align: center;
+            font-weight: 600;
+            font-size: 1.8rem;
+            letter-spacing: -0.02em;
+            color: #f0f2f5;
+            margin-bottom: 8px;
+        }
+        .title span {
+            background: linear-gradient(135deg, #b7bdc6, #d1d7e0);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        .sub-head {
+            text-align: center;
+            font-size: 0.95rem;
+            color: #8e9297;
+            margin-bottom: 32px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+            padding-bottom: 18px;
+        }
+        .input-group {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            margin-bottom: 28px;
+        }
+        .input-group label {
+            font-weight: 500;
+            font-size: 0.9rem;
+            color: #c4c9ce;
+            letter-spacing: 0.3px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .input-group label i {
+            color: #6c8cff;
+            font-size: 1rem;
+        }
+        .input-row {
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+        .input-row input {
+            flex: 2;
+            min-width: 180px;
+            background: #2f3136;
+            border: 1px solid #40444b;
+            border-radius: 40px;
+            padding: 14px 22px;
+            font-size: 1rem;
+            color: #f0f2f5;
+            outline: none;
+            transition: 0.2s;
+            font-weight: 450;
+        }
+        .input-row input:focus {
+            border-color: #6c8cff;
+            background: #35393f;
+            box-shadow: 0 0 0 3px rgba(108, 140, 255, 0.15);
+        }
+        .input-row input::placeholder {
+            color: #6a6f78;
+            font-weight: 400;
+        }
+        .btn-primary {
+            flex: 0 0 auto;
+            background: #5865f2;
+            border: none;
+            border-radius: 40px;
+            padding: 14px 32px;
+            font-weight: 600;
+            font-size: 1rem;
+            color: white;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            transition: 0.2s;
+            box-shadow: 0 4px 12px rgba(88, 101, 242, 0.3);
+            letter-spacing: 0.3px;
+            white-space: nowrap;
+        }
+        .btn-primary:hover {
+            background: #4752c4;
+            transform: scale(1.02);
+            box-shadow: 0 6px 16px rgba(88, 101, 242, 0.4);
+        }
+        .btn-primary:active {
+            transform: scale(0.97);
+        }
+        .btn-primary:disabled {
+            opacity: 0.7;
+            cursor: default;
+            transform: none;
+            box-shadow: none;
+        }
+        #resultsSection {
+            margin-top: 20px;
+            background: rgba(0, 0, 0, 0.25);
+            border-radius: 28px;
+            padding: 18px 20px;
+            backdrop-filter: blur(4px);
+            border: 1px solid rgba(255, 255, 255, 0.02);
+        }
+        .terminal {
+            font-family: 'Fira Code', 'JetBrains Mono', 'Courier New', monospace;
+            font-size: 0.9rem;
+            color: #b9bbbe;
+            background: #1e1f22;
+            padding: 16px 18px;
+            border-radius: 20px;
+            min-height: 70px;
+            white-space: pre-wrap;
+            word-break: break-word;
+            line-height: 1.6;
+            border-left: 3px solid #5865f2;
+            box-shadow: inset 0 2px 6px rgba(0,0,0,0.4);
+        }
+        .terminal .highlight {
+            color: #a6c8ff;
+        }
+        .action-row {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            justify-content: flex-end;
+            gap: 12px;
+            margin-top: 6px;
+            min-height: 10px;
+        }
+        .notfound-badge {
+            background: #da373c20;
+            border: 1px solid #da373c60;
+            border-radius: 40px;
+            padding: 8px 20px;
+            color: #f6a8ab;
+            font-weight: 500;
+            font-size: 0.9rem;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .hidden {
+            display: none !important;
+        }
+        .footer-links {
+            display: flex;
+            justify-content: center;
+            gap: 24px;
+            margin-top: 36px;
+            flex-wrap: wrap;
+        }
+        .footer-btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 12px;
+            background: rgba(255, 255, 255, 0.04);
+            backdrop-filter: blur(4px);
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            padding: 12px 28px;
+            border-radius: 60px;
+            color: #d1d7e0;
+            font-weight: 500;
+            font-size: 1rem;
+            text-decoration: none;
+            transition: 0.25s;
+            box-shadow: 0 6px 12px rgba(0, 0, 0, 0.2);
+            letter-spacing: 0.2px;
+        }
+        .footer-btn i {
+            font-size: 1.3rem;
+        }
+        .footer-btn.github:hover {
+            background: #2b3137;
+            border-color: #8b949e;
+            color: white;
+            transform: translateY(-2px);
+        }
+        .footer-btn.discord:hover {
+            background: #404eed;
+            border-color: #7983f5;
+            color: white;
+            transform: translateY(-2px);
+        }
+        @media (max-width: 550px) {
+            .glass-card { padding: 28px 18px; }
+            .title { font-size: 1.5rem; }
+            .input-row { flex-direction: column; }
+            .input-row input { width: 100%; }
+            .btn-primary { width: 100%; justify-content: center; }
+            .footer-links { flex-direction: column; align-items: center; }
+            .footer-btn { width: 100%; justify-content: center; }
+        }
+        .spinner {
+            display: inline-block;
+            width: 18px;
+            height: 18px;
+            border: 2px solid rgba(255,255,255,0.2);
+            border-top: 2px solid white;
+            border-radius: 50%;
+            animation: spin 0.7s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
 
-    <div class="input-group">  
-        <label for="gameId"><i class="fas fa-hashtag"></i> Введите AppID или название игры</label>  
-        <div class="input-row">  
-            <input type="text" id="gameId" placeholder="Например, Team Fortress 2, 440" />  
-            <button id="checkBtn" class="btn-primary">  
-                <i class="fas fa-magnifying-glass"></i> Скачать  
-            </button>  
-        </div>  
-    </div>  
+        /* game grid */
+        .game-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 12px;
+            margin-top: 20px;
+            max-height: 380px;
+            overflow-y: auto;
+            padding-right: 6px;
+        }
+        .game-grid::-webkit-scrollbar {
+            width: 6px;
+        }
+        .game-grid::-webkit-scrollbar-thumb {
+            background: #40444b;
+            border-radius: 10px;
+        }
+        .game-grid::-webkit-scrollbar-track {
+            background: transparent;
+        }
+        .game-item {
+            background: #2f3136;
+            border: 1px solid #40444b;
+            border-radius: 16px;
+            padding: 10px 6px;
+            text-align: center;
+            font-size: 0.8rem;
+            color: #d1d7e0;
+            cursor: pointer;
+            transition: 0.15s;
+            word-break: break-word;
+            line-height: 1.3;
+            min-height: 54px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .game-item:hover {
+            background: #40444b;
+            border-color: #6c8cff;
+            transform: scale(1.02);
+        }
+        .game-item:active {
+            transform: scale(0.97);
+        }
+        .game-item .appid {
+            color: #8e9297;
+            font-size: 0.65rem;
+            display: block;
+            margin-top: 2px;
+        }
 
-    <div id="resultsSection" class="hidden">  
-        <div class="terminal" id="terminalOutput"></div>  
-        <div class="action-row">  
-            <div id="notFoundSection" class="hidden">  
-                <span class="notfound-badge"><i class="fas fa-circle-exclamation"></i> Манифест не найден</span>  
-            </div>  
-        </div>  
-    </div>  
+        .scroll-hint {
+            color: #8e9297;
+            font-size: 0.8rem;
+            text-align: center;
+            margin-top: 8px;
+            opacity: 0.7;
+        }
+    </style>
+</head>
+<body>
+<div class="glass-card">
+    <div class="title">
+        <span>Генератор «Manifest»</span>
+    </div>
+    <div class="sub-head">
+        для SteamLuaTools
+    </div>
 
-    <div class="footer-links">  
-        <a href="https://github.com/rodekplay" target="_blank" class="footer-btn github">  
-            <i class="fab fa-github"></i> GitHub  
-        </a>  
-        <a href="https://rodekplay.github.io/cs-news.github.io/" target="_blank" class="footer-btn discord">  
-            <i class="fab fa-discord"></i> Discord сервер  
-        </a>  
-    </div>  
-</div>  
+    <div class="input-group">
+        <label for="gameId"><i class="fas fa-hashtag"></i> Введите AppID или название игры</label>
+        <div class="input-row">
+            <input type="text" id="gameId" placeholder="Например, Team Fortress 2, 945360" />
+            <button id="checkBtn" class="btn-primary">
+                <i class="fas fa-magnifying-glass"></i> Скачать
+            </button>
+        </div>
+    </div>
 
-<script>  
-    (function() {  
-        "use strict";  
+    <div id="resultsSection" class="hidden">
+        <div class="terminal" id="terminalOutput"></div>
+        <div class="action-row">
+            <div id="notFoundSection" class="hidden">
+                <span class="notfound-badge"><i class="fas fa-circle-exclamation"></i> Манифест не найден</span>
+            </div>
+        </div>
+    </div>
 
-        let gameDatabase = []; // Будет заполнено из JSON  
+    <!-- Список игр (4 в ряд, скролл) -->
+    <div id="gameListContainer">
+        <div class="game-grid" id="gameGrid"></div>
+        <div class="scroll-hint"><i class="fas fa-chevron-down"></i> прокрутите для большего выбора</div>
+    </div>
 
-        const gameIdInput = document.getElementById('gameId');  
-        const checkBtn = document.getElementById('checkBtn');  
-        const resultsSection = document.getElementById('resultsSection');  
-        const terminalOutput = document.getElementById('terminalOutput');  
-        const notFoundSection = document.getElementById('notFoundSection');  
+    <div class="footer-links">
+        <a href="https://github.com/rodekplay" target="_blank" class="footer-btn github">
+            <i class="fab fa-github"></i> GitHub
+        </a>
+        <a href="https://rodekplay.github.io/cs-news.github.io/" target="_blank" class="footer-btn discord">
+            <i class="fab fa-discord"></i> Discord сервер
+        </a>
+    </div>
+</div>
 
-        resultsSection.classList.add('hidden');  
+<script>
+    (function() {
+        "use strict";
 
-        // --- ЗАГРУЗКА ДАННЫХ ИЗ ФАЙЛА ---  
-        async function loadGameDatabase() {  
-            try {  
-                const response = await fetch('steamname.json');  
-                if (!response.ok) throw new Error('Файл не найден');  
-                const data = await response.json();  
-                if (data && data.applist && Array.isArray(data.applist.apps)) {  
-                    gameDatabase = data.applist.apps;  
-                    console.log(`✅ Загружено ${gameDatabase.length} игр`);  
-                }  
-            } catch (error) {  
-                console.error('Ошибка загрузки базы игр:', error);  
-                // Если файл не загрузился — оставляем пустую базу  
-            }  
-        }  
+        const gameIdInput = document.getElementById('gameId');
+        const checkBtn = document.getElementById('checkBtn');
+        const resultsSection = document.getElementById('resultsSection');
+        const terminalOutput = document.getElementById('terminalOutput');
+        const notFoundSection = document.getElementById('notFoundSection');
+        const gameGrid = document.getElementById('gameGrid');
 
-        // --- ПОИСК ID ПО НАЗВАНИЮ ---  
-        function findAppIdByName(query) {  
-            const lowerQuery = query.toLowerCase().trim();  
-            const words = lowerQuery.split(/\s+/).filter(w => w.length > 0);  
+        let appList = [];
+        let allGames = [];
 
-            // Ищем по всем словам (AND)  
-            const results = gameDatabase.filter(game => {  
-                const nameLower = game.name.toLowerCase();  
-                return words.every(word => nameLower.includes(word));  
-            });  
+        // Загрузка steamname.json
+        async function loadGames() {
+            try {
+                const resp = await fetch('steamname.json');
+                const data = await resp.json();
+                if (data && data.applist && Array.isArray(data.applist.apps)) {
+                    allGames = data.applist.apps.map(app => ({
+                        appid: app.appid,
+                        name: app.name || 'Unknown'
+                    }));
+                    // сортировка по имени
+                    allGames.sort((a, b) => a.name.localeCompare(b.name));
+                    renderGames(allGames.slice(0, 80)); // покажем первые 80, чтобы не перегружать
+                } else {
+                    console.warn('Неверный формат steamname.json');
+                }
+            } catch (e) {
+                console.warn('Не удалось загрузить steamname.json, используем fallback');
+                // небольшой fallback, чтобы интерфейс не был пустым
+                allGames = [
+                    { appid: 440, name: "Team Fortress 2" },
+                    { appid: 730, name: "Counter-Strike: Global Offensive" },
+                    { appid: 570, name: "Dota 2" },
+                    { appid: 10, name: "Counter-Strike" },
+                    { appid: 220, name: "Half-Life 2" },
+                ];
+                renderGames(allGames);
+            }
+        }
 
-            // Если нашлась ровно одна игра — возвращаем её ID  
-            if (results.length === 1) {  
-                return String(results[0].appid);  
-            }  
+        function renderGames(games) {
+            gameGrid.innerHTML = '';
+            games.forEach(game => {
+                const div = document.createElement('div');
+                div.className = 'game-item';
+                div.innerHTML = `${game.name} <span class="appid">${game.appid}</span>`;
+                div.addEventListener('click', () => {
+                    // вставляем appid в поиск и нажимаем скачать
+                    gameIdInput.value = game.appid;
+                    // имитация нажатия кнопки
+                    checkBtn.click();
+                });
+                gameGrid.appendChild(div);
+            });
+        }
 
-            // Если нашлось несколько — показываем все в консоли, но берём первый  
-            if (results.length > 1) {  
-                console.log(`Найдено несколько игр:`, results.map(g => `${g.name} (${g.appid})`).join(', '));  
-                return String(results[0].appid);  
-            }  
+        // поиск по названию (по словам и буквам)
+        function searchGames(query) {
+            if (!query.trim()) {
+                renderGames(allGames.slice(0, 80));
+                return;
+            }
+            const q = query.trim().toLowerCase();
+            // если q состоит только из цифр — поиск по appid
+            if (/^\d+$/.test(q)) {
+                const found = allGames.filter(g => String(g.appid).includes(q));
+                renderGames(found.slice(0, 120));
+                return;
+            }
+            // ищем по названию: разбиваем запрос на слова, ищем вхождение каждого слова
+            const words = q.split(/\s+/).filter(w => w.length > 0);
+            const results = allGames.filter(game => {
+                const name = game.name.toLowerCase();
+                // если одно слово — просто includes
+                if (words.length === 1) {
+                    return name.includes(words[0]);
+                }
+                // если несколько — все слова должны быть где-то в названии
+                return words.every(w => name.includes(w));
+            });
+            renderGames(results.slice(0, 120));
+        }
 
-            return null;  
-        }  
+        // обработчик ввода в поле поиска (поиск по мере ввода)
+        gameIdInput.addEventListener('input', function(e) {
+            const val = this.value.trim();
+            if (val === '') {
+                renderGames(allGames.slice(0, 80));
+                return;
+            }
+            searchGames(val);
+        });
 
-        function resetUI() {  
-            notFoundSection.classList.add('hidden');  
-            terminalOutput.textContent = '';  
-            checkBtn.disabled = false;  
-            checkBtn.innerHTML = '<i class="fas fa-magnifying-glass"></i> Скачать';  
-        }  
+        // при нажатии Enter — поиск (и так уже работает, но оставим для совместимости)
+        gameIdInput.addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                // search уже сработал от input, но если пользователь ввел id и нажал enter — запустим проверку
+                checkBtn.click();
+            }
+        });
 
-        function typeText(text, callback) {  
-            let index = 0;  
-            terminalOutput.textContent = '';  
-            function tick() {  
-                if (index < text.length) {  
-                    terminalOutput.textContent += text.charAt(index);  
-                    index++;  
-                    setTimeout(tick, 18);  
-                } else {  
-                    if (callback) callback();  
-                }  
-            }  
-            tick();  
-        }  
+        // остальное — как в оригинале
+        resultsSection.classList.add('hidden');
 
-        function triggerDownload(url, filename) {  
-            const a = document.createElement('a');  
-            a.href = url;  
-            a.download = filename;  
-            document.body.appendChild(a);  
-            a.click();  
-            document.body.removeChild(a);  
-        }  
+        function resetUI() {
+            notFoundSection.classList.add('hidden');
+            terminalOutput.textContent = '';
+            checkBtn.disabled = false;
+            checkBtn.innerHTML = '<i class="fas fa-magnifying-glass"></i> Скачать';
+        }
 
-        async function checkManifest() {  
-            let rawInput = gameIdInput.value.trim();  
+        function typeText(text, callback) {
+            let index = 0;
+            terminalOutput.textContent = '';
+            function tick() {
+                if (index < text.length) {
+                    terminalOutput.textContent += text.charAt(index);
+                    index++;
+                    setTimeout(tick, 18);
+                } else {
+                    if (callback) callback();
+                }
+            }
+            tick();
+        }
 
-            if (!rawInput) {  
-                resultsSection.classList.remove('hidden');  
-                notFoundSection.classList.add('hidden');  
-                typeText('⚠️ Ошибка: введите AppID или название игры.');  
-                return;  
-            }  
+        function triggerDownload(url, filename) {
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename || 'manifest.zip';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+        }
 
-            // --- ЕСЛИ ВВЕДЕНО НЕ ЧИСЛО — ИЩЕМ ПО НАЗВАНИЮ ---  
-            let gameId = rawInput;  
-            if (!/^\d+$/.test(rawInput)) {  
-                const foundId = findAppIdByName(rawInput);  
-                if (foundId) {  
-                    gameId = foundId;  
-                    gameIdInput.value = foundId;  
-                } else {  
-                    resultsSection.classList.remove('hidden');  
-                    notFoundSection.classList.add('hidden');  
-                    typeText(`❌ Игра "${rawInput}" не найдена в базе.\nПопробуйте ввести AppID напрямую.`);  
-                    return;  
-                }  
-            }  
+        async function checkManifest() {
+            const gameId = gameIdInput.value.trim();
 
-            // --- ДАЛЬШЕ ОРИГИНАЛЬНЫЙ КОД ---  
-            checkBtn.disabled = true;  
-            checkBtn.innerHTML = '<span class="spinner"></span> Поиск...';  
+            if (!gameId || !/^\d+$/.test(gameId)) {
+                resultsSection.classList.remove('hidden');
+                notFoundSection.classList.add('hidden');
+                typeText('⚠️ Ошибка: введите корректный Steam AppID (только цифры).');
+                return;
+            }
 
-            resultsSection.classList.remove('hidden');  
-            notFoundSection.classList.add('hidden');  
+            checkBtn.disabled = true;
+            checkBtn.innerHTML = '<span class="spinner"></span> Поиск...';
 
-            const startMsg = `🔍 Проверка манифеста для AppID: ${gameId}\n📡 Запрос к базе...\n`;  
-            await new Promise((resolve) => {  
-                typeText(startMsg, resolve);  
-            });  
+            resultsSection.classList.remove('hidden');
+            notFoundSection.classList.add('hidden');
 
-            try {  
-                const response = await fetch(`https://api.github.com/repos/SPIN0ZAi/SB_manifest_DB/branches/${gameId}`, {  
-                    headers: { 'Accept': 'application/vnd.github.v3+json' }  
-                });  
+            const startMsg = `🔍 Проверка манифеста для AppID: ${gameId}\n📡 Запрос к базе...\n`;
+            await new Promise((resolve) => {
+                typeText(startMsg, resolve);
+            });
 
-                if (response.status === 200) {  
-                    const foundMsg = `✅ Манифест найден!\n📦 Подготовка ссылки...\n`;  
-                    await new Promise((resolve) => {  
-                        typeText(foundMsg, resolve);  
-                    });  
+            try {
+                const response = await fetch(`https://api.github.com/repos/SPIN0ZAi/SB_manifest_DB/branches/${gameId}`, {
+                    headers: { 'Accept': 'application/vnd.github.v3+json' }
+                });
 
-                    const zipUrl = `https://codeload.github.com/SPIN0ZAi/SB_manifest_DB/zip/refs/heads/${gameId}`;  
-                    terminalOutput.textContent += `✔ Готово.`;  
-                    triggerDownload(zipUrl);  
+                if (response.status === 200) {
+                    const foundMsg = `✅ Манифест найден!\n📦 Подготовка ссылки...\n`;
+                    await new Promise((resolve) => {
+                        typeText(foundMsg, resolve);
+                    });
 
-                } else {  
-                    const notFoundMsg = `❌ Манифест для AppID ${gameId} не найден в базе.\nПопробуйте другой ID.`;  
-                    await new Promise((resolve) => {  
-                        typeText(notFoundMsg, resolve);  
-                    });  
-                    notFoundSection.classList.remove('hidden');  
-                }  
-            } catch (err) {  
-                const errorMsg = `⚠️ Ошибка соединения. Проверьте интернет и повторите.\n${err.message || ''}`;  
-                await new Promise((resolve) => {  
-                    typeText(errorMsg, resolve);  
-                });  
-                notFoundSection.classList.add('hidden');  
-            } finally {  
-                checkBtn.disabled = false;  
-                checkBtn.innerHTML = '<i class="fas fa-magnifying-glass"></i> Скачать';  
-            }  
-        }  
+                    const zipUrl = `https://codeload.github.com/SPIN0ZAi/SB_manifest_DB/zip/refs/heads/${gameId}`;
 
-        // --- ЗАГРУЖАЕМ БАЗУ ПРИ СТАРТЕ ---  
-        loadGameDatabase();  
+                    terminalOutput.textContent += `✔ Готово.`;
+                    triggerDownload(zipUrl);
 
-        checkBtn.addEventListener('click', function(e) {  
-            e.preventDefault();  
-            resetUI();  
-            checkManifest();  
-        });  
+                } else {
+                    const notFoundMsg = `❌ Манифест для AppID ${gameId} не найден в базе.\nПопробуйте другой ID.`;
+                    await new Promise((resolve) => {
+                        typeText(notFoundMsg, resolve);
+                    });
+                    notFoundSection.classList.remove('hidden');
+                }
+            } catch (err) {
+                const errorMsg = `⚠️ Ошибка соединения. Проверьте интернет и повторите.\n${err.message || ''}`;
+                await new Promise((resolve) => {
+                    typeText(errorMsg, resolve);
+                });
+                notFoundSection.classList.add('hidden');
+            } finally {
+                checkBtn.disabled = false;
+                checkBtn.innerHTML = '<i class="fas fa-magnifying-glass"></i> Скачать';
+            }
+        }
 
-        gameIdInput.addEventListener('keypress', function(e) {  
-            if (e.key === 'Enter') {  
-                e.preventDefault();  
-                resetUI();  
-                checkManifest();  
-            }  
-        });  
+        checkBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            resetUI();
+            checkManifest();
+        });
 
-        console.log('Генератор Manifest для SteamLuaTools — загружает данные из steamname.json');  
-    })();  
-</script>  
-</body>  
+        // загружаем игры
+        loadGames();
+
+        console.log('Генератор Manifest для SteamLuaTools — поиск по названию + список игр');
+    })();
+</script>
+</body>
 </html>
