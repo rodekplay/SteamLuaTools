@@ -1,5 +1,5 @@
 <p align="left">
-  <img src="https://img.shields.io/badge/Версия-beta-8.0-blue?style=plastic">
+  <img src="https://img.shields.io/badge/Версия-8.0-blue?style=plastic">
   <img src="https://img.shields.io/badge/Дата-2026.08.21-blue?style=plastic">
   <img src="https://img.shields.io/badge/Скачивания-1.5k-brightgreen?style=plastic">
   <img src="https://img.shields.io/github/stars/rodekplay/SteamLuaTools?style=plastic&label=Stars&color=yellow">
