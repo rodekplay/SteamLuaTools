@@ -58,6 +58,7 @@
             flex-direction: column;
             gap: 12px;
             margin-bottom: 28px;
+            position: relative;
         }
         .input-group label {
             font-weight: 500;
@@ -76,6 +77,7 @@
             display: flex;
             gap: 12px;
             flex-wrap: wrap;
+            position: relative;
         }
         .input-row input {
             flex: 2;
@@ -243,65 +245,6 @@
             100% { transform: rotate(360deg); }
         }
 
-        /* Список игр */
-        .game-grid {
-            display: grid;
-            grid-template-columns: repeat(4, 1fr);
-            gap: 8px;
-            margin-top: 16px;
-            max-height: 320px;
-            overflow-y: auto;
-            padding-right: 4px;
-        }
-        .game-grid::-webkit-scrollbar {
-            width: 4px;
-        }
-        .game-grid::-webkit-scrollbar-thumb {
-            background: #40444b;
-            border-radius: 10px;
-        }
-        .game-grid::-webkit-scrollbar-track {
-            background: transparent;
-        }
-        .game-item {
-            background: #2f3136;
-            border: 1px solid #40444b;
-            border-radius: 12px;
-            padding: 8px 4px;
-            text-align: center;
-            font-size: 0.75rem;
-            color: #d1d7e0;
-            cursor: pointer;
-            transition: 0.15s;
-            word-break: break-word;
-            line-height: 1.3;
-            min-height: 48px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            flex-direction: column;
-        }
-        .game-item:hover {
-            background: #40444b;
-            border-color: #6c8cff;
-            transform: scale(1.02);
-        }
-        .game-item:active {
-            transform: scale(0.97);
-        }
-        .game-item .appid {
-            color: #8e9297;
-            font-size: 0.6rem;
-            display: block;
-            margin-top: 2px;
-        }
-        .scroll-hint {
-            color: #8e9297;
-            font-size: 0.7rem;
-            text-align: center;
-            margin-top: 6px;
-            opacity: 0.5;
-        }
         /* Список результатов поиска (выпадающий) */
         .search-results-list {
             list-style: none;
@@ -313,6 +256,12 @@
             border-radius: 16px;
             border: 1px solid #40444b;
             display: none;
+            position: absolute;
+            top: 100%;
+            left: 0;
+            right: 0;
+            z-index: 100;
+            width: 100%;
         }
         .search-results-list li {
             padding: 8px 16px;
@@ -344,6 +293,12 @@
         .search-results-list::-webkit-scrollbar-track {
             background: transparent;
         }
+
+        /* Контейнер для поиска, чтобы список был привязан */
+        .search-wrapper {
+            position: relative;
+            width: 100%;
+        }
     </style>
 </head>
 <body>
@@ -357,12 +312,14 @@
 
     <div class="input-group">
         <label for="gameId"><i class="fas fa-hashtag"></i> Введите AppID или название игры</label>
-        <div class="input-row" style="position: relative;">
-            <input type="text" id="gameId" placeholder="Например, Team Fortress 2, 945360" autocomplete="off" />
+        <div class="input-row">
+            <div class="search-wrapper">
+                <input type="text" id="gameId" placeholder="Например, Team Fortress 2, 945360" autocomplete="off" />
+                <ul class="search-results-list" id="searchResults"></ul>
+            </div>
             <button id="checkBtn" class="btn-primary">
                 <i class="fas fa-magnifying-glass"></i> Скачать
             </button>
-            <ul class="search-results-list" id="searchResults"></ul>
         </div>
     </div>
 
@@ -373,12 +330,6 @@
                 <span class="notfound-badge"><i class="fas fa-circle-exclamation"></i> Манифест не найден</span>
             </div>
         </div>
-    </div>
-
-    <!-- Список игр (4 в ряд, скролл) -->
-    <div id="gameListContainer">
-        <div class="game-grid" id="gameGrid"></div>
-        <div class="scroll-hint"><i class="fas fa-chevron-down"></i> прокрутите для большего выбора</div>
     </div>
 
     <div class="footer-links">
@@ -400,7 +351,6 @@
         const resultsSection = document.getElementById('resultsSection');
         const terminalOutput = document.getElementById('terminalOutput');
         const notFoundSection = document.getElementById('notFoundSection');
-        const gameGrid = document.getElementById('gameGrid');
         const searchResults = document.getElementById('searchResults');
 
         let allGames = [];
@@ -416,9 +366,7 @@
                         appid: String(app.appid),
                         name: app.name || 'Unknown'
                     }));
-                    // сортировка по имени
                     allGames.sort((a, b) => a.name.localeCompare(b.name));
-                    renderGames(allGames.slice(0, 80));
                 } else {
                     console.warn('Неверный формат steamname.json');
                     fallbackGames();
@@ -441,22 +389,6 @@
                 { appid: '550', name: 'Left 4 Dead 2' },
             ];
             allGames.sort((a, b) => a.name.localeCompare(b.name));
-            renderGames(allGames);
-        }
-
-        function renderGames(games) {
-            gameGrid.innerHTML = '';
-            games.forEach(game => {
-                const div = document.createElement('div');
-                div.className = 'game-item';
-                div.innerHTML = `${game.name} <span class="appid">${game.appid}</span>`;
-                div.addEventListener('click', () => {
-                    gameIdInput.value = game.appid;
-                    searchResults.style.display = 'none';
-                    checkBtn.click();
-                });
-                gameGrid.appendChild(div);
-            });
         }
 
         // Поиск — как в Python скрипте: сначала по началу названия, потом по вхождению
@@ -489,9 +421,7 @@
                 const extra = [];
                 for (const game of allGames) {
                     const nameLower = game.name.toLowerCase();
-                    // если уже есть в matches — пропускаем
                     if (matches.some(m => m.appid === game.appid)) continue;
-                    // все слова должны присутствовать
                     const allWordsMatch = words.every(w => nameLower.includes(w));
                     if (allWordsMatch) {
                         extra.push(game);
@@ -542,7 +472,6 @@
         gameIdInput.addEventListener('input', function() {
             const val = this.value.trim();
 
-            // Если ввели только цифры — прячем список, поиск по id будет при нажатии кнопки
             if (/^\d+$/.test(val)) {
                 searchResults.style.display = 'none';
                 return;
@@ -552,8 +481,6 @@
             searchTimeout = setTimeout(() => {
                 if (!val) {
                     searchResults.style.display = 'none';
-                    // Показываем стандартную сетку
-                    renderGames(allGames.slice(0, 80));
                     return;
                 }
                 const results = searchGames(val);
@@ -565,7 +492,6 @@
         gameIdInput.addEventListener('keypress', function(e) {
             if (e.key === 'Enter') {
                 e.preventDefault();
-                // Если список результатов открыт и есть выбор — берём первый
                 const items = searchResults.querySelectorAll('li');
                 if (items.length > 0) {
                     const first = items[0];
@@ -584,12 +510,11 @@
 
         // Клик вне списка — скрываем
         document.addEventListener('click', function(e) {
-            if (!e.target.closest('.input-row')) {
+            if (!e.target.closest('.search-wrapper')) {
                 searchResults.style.display = 'none';
             }
         });
 
-        // Остальное — как в оригинале
         resultsSection.classList.add('hidden');
 
         function resetUI() {
@@ -614,13 +539,46 @@
             tick();
         }
 
-        function triggerDownload(url, filename) {
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = filename || 'manifest.zip';
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
+        // Скачивание архива с удалением ненужных файлов
+        async function triggerDownloadWithCleanup(url, filename) {
+            try {
+                // Скачиваем архив как бинарные данные
+                const response = await fetch(url);
+                if (!response.ok) throw new Error('Ошибка загрузки архива');
+                const blob = await response.blob();
+
+                // Используем JSZip для обработки архива
+                const zip = await JSZip.loadAsync(blob);
+                
+                // Удаляем ненужные файлы
+                const filesToRemove = ['appaccesstokens.json', 'depotkeys.json'];
+                filesToRemove.forEach(file => {
+                    if (zip.file(file)) {
+                        zip.remove(file);
+                    }
+                });
+
+                // Генерируем новый zip
+                const newZipBlob = await zip.generateAsync({ type: 'blob' });
+                
+                // Скачиваем очищенный архив
+                const a = document.createElement('a');
+                a.href = URL.createObjectURL(newZipBlob);
+                a.download = filename || 'manifest.zip';
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(a.href);
+            } catch (error) {
+                console.error('Ошибка при обработке архива:', error);
+                // Если не удалось обработать — скачиваем как есть
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = filename || 'manifest.zip';
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+            }
         }
 
         async function checkManifest() {
@@ -657,7 +615,9 @@
 
                     const zipUrl = `https://codeload.github.com/SPIN0ZAi/SB_manifest_DB/zip/refs/heads/${gameId}`;
                     terminalOutput.textContent += `✔ Готово.`;
-                    triggerDownload(zipUrl);
+                    
+                    // Скачивание с очисткой
+                    await triggerDownloadWithCleanup(zipUrl, `manifest_${gameId}.zip`);
 
                 } else {
                     const notFoundMsg = `❌ Манифест для AppID ${gameId} не найден в базе.\nПопробуйте другой ID.`;
@@ -690,5 +650,8 @@
         console.log('Генератор Manifest для SteamLuaTools — поиск как в Python скрипте');
     })();
 </script>
+
+<!-- Подключаем JSZip для работы с архивами -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 </body>
 </html>
