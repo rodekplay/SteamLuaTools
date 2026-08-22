@@ -30,6 +30,7 @@
             padding: 40px 32px;
             box-shadow: 0 25px 40px -10px rgba(0, 0, 0, 0.7), inset 0 1px 2px rgba(255, 255, 255, 0.06);
             border: 1px solid rgba(255, 255, 255, 0.03);
+            position: relative;
         }
         .title {
             text-align: center;
@@ -79,9 +80,13 @@
             flex-wrap: wrap;
             position: relative;
         }
-        .input-row input {
+        .search-wrapper {
+            position: relative;
             flex: 2;
             min-width: 180px;
+        }
+        .search-wrapper input {
+            width: 100%;
             background: #2f3136;
             border: 1px solid #40444b;
             border-radius: 40px;
@@ -92,12 +97,12 @@
             transition: 0.2s;
             font-weight: 450;
         }
-        .input-row input:focus {
+        .search-wrapper input:focus {
             border-color: #6c8cff;
             background: #35393f;
             box-shadow: 0 0 0 3px rgba(108, 140, 255, 0.15);
         }
-        .input-row input::placeholder {
+        .search-wrapper input::placeholder {
             color: #6a6f78;
             font-weight: 400;
         }
@@ -226,7 +231,7 @@
             .glass-card { padding: 28px 18px; }
             .title { font-size: 1.5rem; }
             .input-row { flex-direction: column; }
-            .input-row input { width: 100%; }
+            .search-wrapper { width: 100%; }
             .btn-primary { width: 100%; justify-content: center; }
             .footer-links { flex-direction: column; align-items: center; }
             .footer-btn { width: 100%; justify-content: center; }
@@ -248,7 +253,7 @@
         /* Список результатов поиска (выпадающий) */
         .search-results-list {
             list-style: none;
-            margin: 4px 0 0 0;
+            margin: 0;
             padding: 0;
             max-height: 220px;
             overflow-y: auto;
@@ -257,10 +262,10 @@
             border: 1px solid #40444b;
             display: none;
             position: absolute;
-            top: 100%;
+            top: calc(100% + 4px);
             left: 0;
             right: 0;
-            z-index: 100;
+            z-index: 1000;
             width: 100%;
         }
         .search-results-list li {
@@ -292,12 +297,6 @@
         }
         .search-results-list::-webkit-scrollbar-track {
             background: transparent;
-        }
-
-        /* Контейнер для поиска, чтобы список был привязан */
-        .search-wrapper {
-            position: relative;
-            width: 100%;
         }
     </style>
 </head>
@@ -391,7 +390,7 @@
             allGames.sort((a, b) => a.name.localeCompare(b.name));
         }
 
-        // Поиск — как в Python скрипте: сначала по началу названия, потом по вхождению
+        // Поиск
         function searchGames(query) {
             const q = query.trim().toLowerCase();
             if (!q) {
@@ -399,7 +398,6 @@
                 return [];
             }
 
-            // если только цифры — поиск по appid
             if (/^\d+$/.test(q)) {
                 const found = allGames.filter(g => g.appid.includes(q));
                 return found.slice(0, 20);
@@ -407,7 +405,6 @@
 
             const words = q.split(/\s+/).filter(w => w.length > 0);
 
-            // 1) точное совпадение начала названия
             let matches = [];
             for (const game of allGames) {
                 const nameLower = game.name.toLowerCase();
@@ -416,7 +413,6 @@
                 }
             }
 
-            // 2) если мало результатов — ищем по вхождению всех слов
             if (matches.length < 8 && words.length > 0) {
                 const extra = [];
                 for (const game of allGames) {
@@ -431,7 +427,6 @@
                 matches = matches.concat(extra);
             }
 
-            // 3) если всё ещё мало — ищем по любому слову
             if (matches.length < 6 && words.length > 1) {
                 const extra = [];
                 for (const game of allGames) {
@@ -468,7 +463,6 @@
             searchResults.style.display = 'block';
         }
 
-        // Обработчик ввода
         gameIdInput.addEventListener('input', function() {
             const val = this.value.trim();
 
@@ -488,7 +482,6 @@
             }, 150);
         });
 
-        // Enter в поле поиска — выполняет поиск и скачивание
         gameIdInput.addEventListener('keypress', function(e) {
             if (e.key === 'Enter') {
                 e.preventDefault();
@@ -508,7 +501,6 @@
             }
         });
 
-        // Клик вне списка — скрываем
         document.addEventListener('click', function(e) {
             if (!e.target.closest('.search-wrapper')) {
                 searchResults.style.display = 'none';
@@ -539,46 +531,13 @@
             tick();
         }
 
-        // Скачивание архива с удалением ненужных файлов
-        async function triggerDownloadWithCleanup(url, filename) {
-            try {
-                // Скачиваем архив как бинарные данные
-                const response = await fetch(url);
-                if (!response.ok) throw new Error('Ошибка загрузки архива');
-                const blob = await response.blob();
-
-                // Используем JSZip для обработки архива
-                const zip = await JSZip.loadAsync(blob);
-                
-                // Удаляем ненужные файлы
-                const filesToRemove = ['appaccesstokens.json', 'depotkeys.json'];
-                filesToRemove.forEach(file => {
-                    if (zip.file(file)) {
-                        zip.remove(file);
-                    }
-                });
-
-                // Генерируем новый zip
-                const newZipBlob = await zip.generateAsync({ type: 'blob' });
-                
-                // Скачиваем очищенный архив
-                const a = document.createElement('a');
-                a.href = URL.createObjectURL(newZipBlob);
-                a.download = filename || 'manifest.zip';
-                document.body.appendChild(a);
-                a.click();
-                document.body.removeChild(a);
-                URL.revokeObjectURL(a.href);
-            } catch (error) {
-                console.error('Ошибка при обработке архива:', error);
-                // Если не удалось обработать — скачиваем как есть
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = filename || 'manifest.zip';
-                document.body.appendChild(a);
-                a.click();
-                document.body.removeChild(a);
-            }
+        function triggerDownload(url, filename) {
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename || 'manifest.zip';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
         }
 
         async function checkManifest() {
@@ -615,9 +574,7 @@
 
                     const zipUrl = `https://codeload.github.com/SPIN0ZAi/SB_manifest_DB/zip/refs/heads/${gameId}`;
                     terminalOutput.textContent += `✔ Готово.`;
-                    
-                    // Скачивание с очисткой
-                    await triggerDownloadWithCleanup(zipUrl, `manifest_${gameId}.zip`);
+                    triggerDownload(zipUrl);
 
                 } else {
                     const notFoundMsg = `❌ Манифест для AppID ${gameId} не найден в базе.\nПопробуйте другой ID.`;
@@ -644,14 +601,10 @@
             checkManifest();
         });
 
-        // Загружаем игры
         loadGames();
 
-        console.log('Генератор Manifest для SteamLuaTools — поиск как в Python скрипте');
+        console.log('Генератор Manifest для SteamLuaTools');
     })();
 </script>
-
-<!-- Подключаем JSZip для работы с архивами -->
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 </body>
 </html>
