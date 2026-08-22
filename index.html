@@ -30,7 +30,6 @@
             padding: 40px 32px;
             box-shadow: 0 25px 40px -10px rgba(0, 0, 0, 0.7), inset 0 1px 2px rgba(255, 255, 255, 0.06);
             border: 1px solid rgba(255, 255, 255, 0.03);
-            position: relative;
         }
         .title {
             text-align: center;
@@ -59,7 +58,6 @@
             flex-direction: column;
             gap: 12px;
             margin-bottom: 28px;
-            position: relative;
         }
         .input-group label {
             font-weight: 500;
@@ -77,13 +75,12 @@
         .input-row {
             display: flex;
             gap: 12px;
-            flex-wrap: wrap;
+            align-items: center;
             position: relative;
         }
         .search-wrapper {
             position: relative;
-            flex: 2;
-            min-width: 180px;
+            flex: 1;
         }
         .search-wrapper input {
             width: 100%;
@@ -266,7 +263,6 @@
             left: 0;
             right: 0;
             z-index: 1000;
-            width: 100%;
         }
         .search-results-list li {
             padding: 8px 16px;
@@ -355,7 +351,6 @@
         let allGames = [];
         let searchTimeout = null;
 
-        // Загрузка steamname.json
         async function loadGames() {
             try {
                 const resp = await fetch('steamname.json');
@@ -390,7 +385,6 @@
             allGames.sort((a, b) => a.name.localeCompare(b.name));
         }
 
-        // Поиск
         function searchGames(query) {
             const q = query.trim().toLowerCase();
             if (!q) {
