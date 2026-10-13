@@ -1,5 +1,5 @@
 // ============================================================
-//  SteamLuaTools 9.5 — MiniGames + Level + CatMode
+//  SteamLuaTools 10.0
 // ============================================================
 #pragma execution_character_set("utf-8")
 #pragma warning(disable: 4061)
@@ -23,6 +23,7 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <commdlg.h>
+#include <tlhelp32.h>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -40,6 +41,7 @@
 #include <cmath>
 #include <random>
 #include <algorithm>
+#include <cstring>
 
 #include "imgui.h"
 #include "imgui_impl_win32.h"
@@ -79,11 +81,14 @@ static void CleanupRenderTarget();
 static LRESULT WINAPI WndProc(HWND, UINT, WPARAM, LPARAM);
 static void LogPush(const std::string& text, bool is_error = false);
 static void SaveSettings();
-static void PushAchievementToast(const std::string& t);
-static void PushToast(const std::string& t);
 
 static HWND g_hwnd = nullptr;
 static std::string g_app_steam_path;
+
+static ID3D11ShaderResourceView* g_icon_small_srv = nullptr;
+static int g_icon_small_w = 0, g_icon_small_h = 0;
+static ID3D11ShaderResourceView* g_logo_srv = nullptr;
+static int g_logo_w = 0, g_logo_h = 0;
 
 // ============================================================
 //  Утилиты
@@ -100,9 +105,310 @@ static void CopyToClipboard(const std::string& text) {
     EmptyClipboard();
     size_t sz = text.size() + 1;
     HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, sz);
-    if (h) { memcpy(GlobalLock(h), text.c_str(), sz); GlobalUnlock(h); SetClipboardData(CF_TEXT, h); }
+    if (h) {
+        void* p = GlobalLock(h);
+        if (p) {
+            memcpy(p, text.c_str(), sz);
+            GlobalUnlock(h);
+            SetClipboardData(CF_TEXT, h);
+        }
+        else {
+            GlobalFree(h);
+        }
+    }
     CloseClipboard();
 }
+
+// ============================================================
+//  Нативные аналоги RunHidden / taskkill (без cmd/powershell)
+// ============================================================
+static bool KillProcessByNameW(const wchar_t* exeName) {
+    bool any = false;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return false;
+    PROCESSENTRY32W pe = {}; pe.dwSize = sizeof(pe);
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (_wcsicmp(pe.szExeFile, exeName) == 0) {
+                HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, pe.th32ProcessID);
+                if (hProc) {
+                    if (TerminateProcess(hProc, 0)) any = true;
+                    CloseHandle(hProc);
+                }
+            }
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    return any;
+}
+
+// ============================================================
+//  Встроенный распаковщик ZIP (без сторонних библиотек)
+//  Минимальный inflate для метода Store и Deflate.
+// ============================================================
+
+// --- CRC32 для проверки не нужен, но полезен при отладке ---
+// --- Читаем локальные заголовки и распаковываем каждый файл ---
+
+namespace zipmin {
+
+    struct Reader {
+        const unsigned char* data;
+        size_t size;
+        size_t pos;
+    };
+
+    static unsigned short read16(const unsigned char* p) { return (unsigned short)(p[0] | (p[1] << 8)); }
+    static unsigned int  read32(const unsigned char* p) { return (unsigned int)(p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24)); }
+
+    // ---------- Inflate (DEFLATE) ----------
+    struct BitReader {
+        const unsigned char* data;
+        size_t size;
+        size_t pos;
+        unsigned int bitBuf = 0;
+        int bitCnt = 0;
+        bool ok = true;
+
+        bool needBits(int n) {
+            while (bitCnt < n) {
+                if (pos >= size) { ok = false; return false; }
+                bitBuf |= (unsigned int)data[pos++] << bitCnt;
+                bitCnt += 8;
+            }
+            return true;
+        }
+        unsigned int getBits(int n) {
+            if (!needBits(n)) return 0;
+            unsigned int v = bitBuf & ((1u << n) - 1u);
+            bitBuf >>= n;
+            bitCnt -= n;
+            return v;
+        }
+        void alignByte() { bitBuf = 0; bitCnt = 0; }
+    };
+
+    struct Huff {
+        unsigned short counts[16] = { 0 };
+        unsigned short symbols[288] = { 0 };
+    };
+
+    static void buildHuff(Huff& h, const unsigned char* lengths, int n) {
+        for (int i = 0; i < 16; i++) h.counts[i] = 0;
+        for (int i = 0; i < n; i++) h.counts[lengths[i]]++;
+        h.counts[0] = 0;
+        unsigned short offs[16] = { 0 };
+        for (int i = 1; i < 16; i++) offs[i] = (unsigned short)(offs[i - 1] + h.counts[i - 1]);
+        for (int i = 0; i < n; i++) if (lengths[i]) h.symbols[offs[lengths[i]]++] = (unsigned short)i;
+    }
+
+    static int decodeSym(BitReader& br, const Huff& h) {
+        int code = 0, first = 0, index = 0;
+        for (int len = 1; len <= 15; len++) {
+            if (!br.needBits(1)) return -1;
+            code |= (int)br.getBits(1);
+            int count = h.counts[len];
+            if (code - count < first) return h.symbols[index + (code - first)];
+            index += count;
+            first = (first + count) << 1;
+            code <<= 1;
+        }
+        return -1;
+    }
+
+    static const int lengthBase[29] = { 3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258 };
+    static const int lengthExtra[29] = { 0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0 };
+    static const int distBase[30] = { 1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577 };
+    static const int distExtra[30] = { 0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13 };
+
+    static bool inflateBlock(BitReader& br, std::vector<unsigned char>& out) {
+        int bfinal = (int)br.getBits(1);
+        int btype = (int)br.getBits(2);
+        if (!br.ok) return false;
+
+        if (btype == 0) {
+            br.alignByte();
+            if (br.pos + 4 > br.size) return false;
+            unsigned short len = read16(br.data + br.pos); br.pos += 2;
+            unsigned short nlen = read16(br.data + br.pos); br.pos += 2;
+            if ((len ^ 0xFFFF) != nlen) return false;
+            if (br.pos + len > br.size) return false;
+            out.insert(out.end(), br.data + br.pos, br.data + br.pos + len);
+            br.pos += len;
+        }
+        else if (btype == 1 || btype == 2) {
+            Huff litLen, distH;
+            if (btype == 1) {
+                unsigned char litLenLen[288];
+                for (int i = 0; i < 144; i++) litLenLen[i] = 8;
+                for (int i = 144; i < 256; i++) litLenLen[i] = 9;
+                for (int i = 256; i < 280; i++) litLenLen[i] = 7;
+                for (int i = 280; i < 288; i++) litLenLen[i] = 8;
+                buildHuff(litLen, litLenLen, 288);
+                for (int i = 0; i < 30; i++) distH.counts[i] = 0;
+                distH.counts[5] = 30;
+                for (int i = 0; i < 30; i++) distH.symbols[i] = (unsigned short)i;
+            }
+            else {
+                int hlit = (int)br.getBits(5) + 257;
+                int hdist = (int)br.getBits(5) + 1;
+                int hclen = (int)br.getBits(4) + 4;
+                if (!br.ok) return false;
+                static const int order[19] = { 16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15 };
+                unsigned char clLens[19] = { 0 };
+                for (int i = 0; i < hclen; i++) clLens[order[i]] = (unsigned char)br.getBits(3);
+                if (!br.ok) return false;
+                Huff clH;
+                buildHuff(clH, clLens, 19);
+
+                unsigned char lens[320] = { 0 };
+                int n = 0;
+                while (n < hlit + hdist) {
+                    int sym = decodeSym(br, clH);
+                    if (sym < 0) return false;
+                    if (sym < 16) lens[n++] = (unsigned char)sym;
+                    else if (sym == 16) {
+                        if (n == 0) return false;
+                        unsigned char prev = lens[n - 1];
+                        int rep = 3 + (int)br.getBits(2);
+                        while (rep-- && n < hlit + hdist) lens[n++] = prev;
+                    }
+                    else if (sym == 17) {
+                        int rep = 3 + (int)br.getBits(3);
+                        while (rep-- && n < hlit + hdist) lens[n++] = 0;
+                    }
+                    else if (sym == 18) {
+                        int rep = 11 + (int)br.getBits(7);
+                        while (rep-- && n < hlit + hdist) lens[n++] = 0;
+                    }
+                }
+                if (!br.ok) return false;
+                buildHuff(litLen, lens, hlit);
+                buildHuff(distH, lens + hlit, hdist);
+            }
+
+            // decode
+            while (true) {
+                int sym = decodeSym(br, litLen);
+                if (sym < 0) return false;
+                if (sym < 256) {
+                    out.push_back((unsigned char)sym);
+                }
+                else if (sym == 256) {
+                    break;
+                }
+                else {
+                    int li = sym - 257;
+                    if (li < 0 || li >= 29) return false;
+                    int len = lengthBase[li] + (int)br.getBits(lengthExtra[li]);
+                    int ds = decodeSym(br, distH);
+                    if (ds < 0 || ds >= 30) return false;
+                    int dist = distBase[ds] + (int)br.getBits(distExtra[ds]);
+                    if ((size_t)dist > out.size()) return false;
+                    size_t start = out.size() - dist;
+                    for (int i = 0; i < len; i++) out.push_back(out[start + i]);
+                }
+            }
+        }
+        else {
+            return false;
+        }
+
+        return !bfinal ? inflateBlock(br, out) : true;
+    }
+
+    static bool inflateRaw(const unsigned char* data, size_t size, std::vector<unsigned char>& out) {
+        BitReader br; br.data = data; br.size = size; br.pos = 0;
+        out.clear();
+        return inflateBlock(br, out);
+    }
+
+    // ---------- ZIP контейнер ----------
+    static bool ExtractAll(const std::string& zipPath, const std::string& outDir) {
+        std::ifstream f(zipPath, std::ios::binary);
+        if (!f) return false;
+        std::vector<unsigned char> buf((std::istreambuf_iterator<char>(f)),
+            std::istreambuf_iterator<char>());
+        if (buf.empty()) return false;
+
+        // найти End Of Central Directory (EOCD) с конца
+        size_t eocd = std::string::npos;
+        for (size_t i = buf.size(); i >= 22 && i >= buf.size() - 65557; i--) {
+            size_t off = i - 22;
+            if (buf[off] == 0x50 && buf[off + 1] == 0x4B && buf[off + 2] == 0x05 && buf[off + 3] == 0x06) {
+                eocd = off; break;
+            }
+            if (off == 0) break;
+        }
+        if (eocd == std::string::npos) return false;
+
+        unsigned int centralOffset = read32(&buf[eocd + 16]);
+        unsigned int totalEntries = read16(&buf[eocd + 10]);
+        unsigned int centralSize = read32(&buf[eocd + 12]);
+        (void)centralSize;
+
+        std::error_code ec;
+        fs::create_directories(outDir, ec);
+
+        size_t pos = centralOffset;
+        for (unsigned int e = 0; e < totalEntries; e++) {
+            if (pos + 46 > buf.size()) break;
+            if (buf[pos] != 0x50 || buf[pos + 1] != 0x4B || buf[pos + 2] != 0x01 || buf[pos + 3] != 0x02) break;
+
+            unsigned short method = read16(&buf[pos + 10]);
+            unsigned int compSize = read32(&buf[pos + 20]);
+            unsigned int uncompSize = read32(&buf[pos + 24]);
+            unsigned short nameLen = read16(&buf[pos + 28]);
+            unsigned short extraLen = read16(&buf[pos + 30]);
+            unsigned short commentLen = read16(&buf[pos + 32]);
+            unsigned int localOffset = read32(&buf[pos + 42]);
+            (void)uncompSize;
+
+            if (pos + 46 + nameLen > buf.size()) break;
+            std::string name((const char*)&buf[pos + 46], nameLen);
+            pos += 46 + nameLen + extraLen + commentLen;
+
+            // локальный заголовок
+            if (localOffset + 30 > buf.size()) continue;
+            if (buf[localOffset] != 0x50 || buf[localOffset + 1] != 0x4B ||
+                buf[localOffset + 2] != 0x03 || buf[localOffset + 3] != 0x04) continue;
+            unsigned short lnameLen = read16(&buf[localOffset + 26]);
+            unsigned short lextraLen = read16(&buf[localOffset + 28]);
+            size_t dataStart = localOffset + 30 + lnameLen + lextraLen;
+            if (dataStart + compSize > buf.size()) continue;
+
+            // заменить '/' на системный разделитель
+            std::string n = name;
+            for (auto& c : n) if (c == '\\') c = '/';
+
+            // пропускаем директории
+            if (!n.empty() && n.back() == '/') continue;
+
+            fs::path outPath = fs::path(outDir) / n;
+            fs::create_directories(outPath.parent_path(), ec);
+
+            if (method == 0) {
+                // stored
+                std::ofstream of(outPath, std::ios::binary);
+                if (of) of.write((const char*)&buf[dataStart], compSize);
+            }
+            else if (method == 8) {
+                // deflate
+                std::vector<unsigned char> out;
+                if (inflateRaw(&buf[dataStart], compSize, out)) {
+                    std::ofstream of(outPath, std::ios::binary);
+                    if (of) of.write((const char*)out.data(), out.size());
+                }
+            }
+            else {
+                // unsupported method
+                continue;
+            }
+        }
+        return true;
+    }
+
+} // namespace zipmin
 
 // ============================================================
 //  Шрифты
@@ -111,6 +417,7 @@ static ImFont* g_font_regular = nullptr;
 static ImFont* g_font_big = nullptr;
 static ImFont* g_font_title = nullptr;
 static ImFont* g_font_small = nullptr;
+static ImFont* g_font_huge = nullptr;
 
 static void LoadFonts() {
     ImGuiIO& io = ImGui::GetIO();
@@ -135,7 +442,8 @@ static void LoadFonts() {
             g_font_regular = io.Fonts->AddFontFromFileTTF(path, 16.0f, &cfg, ranges);
             g_font_small = io.Fonts->AddFontFromFileTTF(path, 13.0f, &cfg, ranges);
             g_font_big = io.Fonts->AddFontFromFileTTF(path, 24.0f, &cfg, ranges);
-            g_font_title = io.Fonts->AddFontFromFileTTF(path, 21.0f, &cfg, ranges);
+            g_font_title = io.Fonts->AddFontFromFileTTF(path, 18.0f, &cfg, ranges);
+            g_font_huge = io.Fonts->AddFontFromFileTTF(path, 30.0f, &cfg, ranges);
             if (g_font_regular) { io.FontDefault = g_font_regular; return; }
         }
     }
@@ -179,7 +487,7 @@ static float g_custom_color_a[4] = { 0.627f, 0.420f, 1.000f, 1.0f };
 static float g_custom_color_b[4] = { 0.980f, 0.400f, 0.650f, 1.0f };
 
 struct ThemeColors {
-    ImVec4 window_bg, topbar_bg;
+    ImVec4 window_bg, topbar_bg, sidebar_bg;
     ImVec4 accent, accent2, accent3;
     ImVec4 accent_hover, accent_active;
     ImVec4 card_bg, card_bg_hover;
@@ -194,68 +502,68 @@ static ThemeColors GetTheme() {
     t.card_bg_hover = ImVec4(1, 1, 1, 0.07f);
     switch (g_theme) {
     case ThemeMode::Blue:
-        t.window_bg = ImVec4(0.024f, 0.035f, 0.078f, 1); t.topbar_bg = t.window_bg;
+        t.window_bg = ImVec4(0.024f, 0.035f, 0.078f, 1); t.topbar_bg = ImVec4(0.018f, 0.026f, 0.058f, 1);
         t.accent = ImVec4(0.35f, 0.60f, 1.00f, 1); t.accent2 = ImVec4(0.60f, 0.80f, 1.00f, 1);
         t.accent3 = ImVec4(0.20f, 0.45f, 0.90f, 1); t.accent_hover = ImVec4(0.45f, 0.70f, 1.00f, 1);
         t.accent_active = ImVec4(0.25f, 0.50f, 0.90f, 1); break;
     case ThemeMode::Purple:
-        t.window_bg = ImVec4(0.039f, 0.027f, 0.063f, 1); t.topbar_bg = t.window_bg;
+        t.window_bg = ImVec4(0.039f, 0.027f, 0.063f, 1); t.topbar_bg = ImVec4(0.028f, 0.020f, 0.048f, 1);
         t.accent = ImVec4(0.627f, 0.420f, 1.000f, 1); t.accent2 = ImVec4(0.980f, 0.400f, 0.650f, 1);
         t.accent3 = ImVec4(0.380f, 0.700f, 1.000f, 1); t.accent_hover = ImVec4(0.72f, 0.53f, 1.00f, 1);
         t.accent_active = ImVec4(0.52f, 0.33f, 0.90f, 1); break;
     case ThemeMode::Green:
-        t.window_bg = ImVec4(0.024f, 0.063f, 0.039f, 1); t.topbar_bg = t.window_bg;
+        t.window_bg = ImVec4(0.024f, 0.063f, 0.039f, 1); t.topbar_bg = ImVec4(0.018f, 0.048f, 0.028f, 1);
         t.accent = ImVec4(0.30f, 0.85f, 0.50f, 1); t.accent2 = ImVec4(0.60f, 1.00f, 0.70f, 1);
         t.accent3 = ImVec4(0.15f, 0.60f, 0.35f, 1); t.accent_hover = ImVec4(0.40f, 0.95f, 0.60f, 1);
         t.accent_active = ImVec4(0.20f, 0.70f, 0.40f, 1); break;
     case ThemeMode::Red:
-        t.window_bg = ImVec4(0.063f, 0.024f, 0.035f, 1); t.topbar_bg = t.window_bg;
+        t.window_bg = ImVec4(0.063f, 0.024f, 0.035f, 1); t.topbar_bg = ImVec4(0.048f, 0.018f, 0.028f, 1);
         t.accent = ImVec4(1.00f, 0.35f, 0.40f, 1); t.accent2 = ImVec4(1.00f, 0.60f, 0.60f, 1);
         t.accent3 = ImVec4(0.80f, 0.20f, 0.30f, 1); t.accent_hover = ImVec4(1.00f, 0.45f, 0.50f, 1);
         t.accent_active = ImVec4(0.85f, 0.25f, 0.30f, 1); break;
     case ThemeMode::Orange:
-        t.window_bg = ImVec4(0.063f, 0.039f, 0.016f, 1); t.topbar_bg = t.window_bg;
+        t.window_bg = ImVec4(0.063f, 0.039f, 0.016f, 1); t.topbar_bg = ImVec4(0.048f, 0.030f, 0.012f, 1);
         t.accent = ImVec4(1.00f, 0.60f, 0.20f, 1); t.accent2 = ImVec4(1.00f, 0.80f, 0.50f, 1);
         t.accent3 = ImVec4(0.85f, 0.45f, 0.10f, 1); t.accent_hover = ImVec4(1.00f, 0.70f, 0.30f, 1);
         t.accent_active = ImVec4(0.85f, 0.50f, 0.15f, 1); break;
     case ThemeMode::Pink:
-        t.window_bg = ImVec4(0.078f, 0.027f, 0.063f, 1); t.topbar_bg = t.window_bg;
+        t.window_bg = ImVec4(0.078f, 0.027f, 0.063f, 1); t.topbar_bg = ImVec4(0.060f, 0.020f, 0.048f, 1);
         t.accent = ImVec4(1.00f, 0.45f, 0.75f, 1); t.accent2 = ImVec4(1.00f, 0.70f, 0.85f, 1);
         t.accent3 = ImVec4(0.85f, 0.35f, 0.65f, 1); t.accent_hover = ImVec4(1.00f, 0.55f, 0.85f, 1);
         t.accent_active = ImVec4(0.85f, 0.35f, 0.65f, 1); break;
     case ThemeMode::Teal:
-        t.window_bg = ImVec4(0.016f, 0.063f, 0.063f, 1); t.topbar_bg = t.window_bg;
+        t.window_bg = ImVec4(0.016f, 0.063f, 0.063f, 1); t.topbar_bg = ImVec4(0.012f, 0.048f, 0.048f, 1);
         t.accent = ImVec4(0.20f, 0.90f, 0.90f, 1); t.accent2 = ImVec4(0.60f, 1.00f, 1.00f, 1);
         t.accent3 = ImVec4(0.15f, 0.70f, 0.70f, 1); t.accent_hover = ImVec4(0.30f, 1.00f, 1.00f, 1);
         t.accent_active = ImVec4(0.15f, 0.75f, 0.75f, 1); break;
     case ThemeMode::Yellow:
-        t.window_bg = ImVec4(0.063f, 0.063f, 0.016f, 1); t.topbar_bg = t.window_bg;
+        t.window_bg = ImVec4(0.063f, 0.063f, 0.016f, 1); t.topbar_bg = ImVec4(0.048f, 0.048f, 0.012f, 1);
         t.accent = ImVec4(0.95f, 0.90f, 0.30f, 1); t.accent2 = ImVec4(1.00f, 0.95f, 0.60f, 1);
         t.accent3 = ImVec4(0.80f, 0.75f, 0.20f, 1); t.accent_hover = ImVec4(1.00f, 0.95f, 0.40f, 1);
         t.accent_active = ImVec4(0.80f, 0.75f, 0.20f, 1); break;
     case ThemeMode::Gray:
-        t.window_bg = ImVec4(0.055f, 0.055f, 0.055f, 1); t.topbar_bg = t.window_bg;
+        t.window_bg = ImVec4(0.055f, 0.055f, 0.055f, 1); t.topbar_bg = ImVec4(0.040f, 0.040f, 0.040f, 1);
         t.accent = ImVec4(0.65f, 0.65f, 0.65f, 1); t.accent2 = ImVec4(0.85f, 0.85f, 0.85f, 1);
         t.accent3 = ImVec4(0.45f, 0.45f, 0.45f, 1); t.accent_hover = ImVec4(0.80f, 0.80f, 0.80f, 1);
         t.accent_active = ImVec4(0.55f, 0.55f, 0.55f, 1); break;
     case ThemeMode::Sunset:
-        t.window_bg = ImVec4(0.078f, 0.027f, 0.043f, 1); t.topbar_bg = t.window_bg;
+        t.window_bg = ImVec4(0.078f, 0.027f, 0.043f, 1); t.topbar_bg = ImVec4(0.060f, 0.020f, 0.032f, 1);
         t.accent = ImVec4(1.00f, 0.55f, 0.25f, 1); t.accent2 = ImVec4(1.00f, 0.40f, 0.55f, 1);
         t.accent3 = ImVec4(0.85f, 0.40f, 0.15f, 1); t.accent_hover = ImVec4(1.00f, 0.35f, 0.55f, 1);
         t.accent_active = ImVec4(0.85f, 0.40f, 0.15f, 1); break;
     case ThemeMode::Ocean:
-        t.window_bg = ImVec4(0.016f, 0.039f, 0.078f, 1); t.topbar_bg = t.window_bg;
+        t.window_bg = ImVec4(0.016f, 0.039f, 0.078f, 1); t.topbar_bg = ImVec4(0.012f, 0.028f, 0.058f, 1);
         t.accent = ImVec4(0.20f, 0.60f, 0.95f, 1); t.accent2 = ImVec4(0.40f, 0.80f, 1.00f, 1);
         t.accent3 = ImVec4(0.15f, 0.45f, 0.85f, 1); t.accent_hover = ImVec4(0.30f, 0.75f, 1.00f, 1);
         t.accent_active = ImVec4(0.15f, 0.45f, 0.85f, 1); break;
     case ThemeMode::Forest:
-        t.window_bg = ImVec4(0.027f, 0.055f, 0.027f, 1); t.topbar_bg = t.window_bg;
+        t.window_bg = ImVec4(0.027f, 0.055f, 0.027f, 1); t.topbar_bg = ImVec4(0.020f, 0.040f, 0.020f, 1);
         t.accent = ImVec4(0.40f, 0.80f, 0.35f, 1); t.accent2 = ImVec4(0.70f, 1.00f, 0.60f, 1);
         t.accent3 = ImVec4(0.30f, 0.65f, 0.25f, 1); t.accent_hover = ImVec4(0.55f, 0.95f, 0.45f, 1);
         t.accent_active = ImVec4(0.30f, 0.65f, 0.25f, 1); break;
     case ThemeMode::Custom:
     default:
-        t.window_bg = ImVec4(0.035f, 0.024f, 0.058f, 1); t.topbar_bg = t.window_bg;
+        t.window_bg = ImVec4(0.035f, 0.024f, 0.058f, 1); t.topbar_bg = ImVec4(0.025f, 0.018f, 0.042f, 1);
         t.accent = ImVec4(g_custom_color_a[0], g_custom_color_a[1], g_custom_color_a[2], 1.0f);
         t.accent2 = ImVec4(g_custom_color_b[0], g_custom_color_b[1], g_custom_color_b[2], 1.0f);
         t.accent3 = ImVec4(g_custom_color_a[0] * 0.7f, g_custom_color_a[1] * 0.7f, g_custom_color_a[2] * 0.7f, 1.0f);
@@ -263,6 +571,7 @@ static ThemeColors GetTheme() {
         t.accent_active = ImVec4(MY_CLAMP(g_custom_color_a[0] * 0.85f, 0, 1), MY_CLAMP(g_custom_color_a[1] * 0.85f, 0, 1), MY_CLAMP(g_custom_color_a[2] * 0.85f, 0, 1), 1);
         break;
     }
+    t.sidebar_bg = t.topbar_bg;
     return t;
 }
 
@@ -278,16 +587,6 @@ static void OpenGameInSteam(const std::string& id) {
 // ============================================================
 //  Steam
 // ============================================================
-static void RunHidden(const std::string& cmd) {
-    STARTUPINFOA si = {}; si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
-    PROCESS_INFORMATION pi = {};
-    std::string m = cmd;
-    if (CreateProcessA(nullptr, m.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-        WaitForSingleObject(pi.hProcess, INFINITE);
-        CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
-    }
-}
 static std::string WideToUtf8(const std::wstring& w) {
     if (w.empty()) return {};
     int size = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
@@ -327,16 +626,25 @@ static std::string FindSteamPath() {
     for (auto p : std_paths) if (fs::exists(std::string(p) + "\\Steam.exe")) return p;
     return {};
 }
-static void CloseSteam() { RunHidden("taskkill /f /im steam.exe"); RunHidden("taskkill /f /im steamwebhelper.exe"); Sleep(1200); }
+static void CloseSteam() {
+    LogPush("Закрываю Steam...");
+    KillProcessByNameW(L"steam.exe");
+    KillProcessByNameW(L"steamwebhelper.exe");
+    Sleep(1200);
+    LogPush("Steam закрыт");
+}
 static void RestartSteam() {
-    if (g_app_steam_path.empty()) return;
+    if (g_app_steam_path.empty()) { LogPush("Перезапуск невозможен: Steam не найден", true); return; }
+    LogPush("Перезапуск Steam: " + g_app_steam_path);
     CloseSteam();
     ShellExecuteA(nullptr, "open", (g_app_steam_path + "\\Steam.exe").c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    LogPush("Steam запущен");
 }
 static void OpenLuaFolder() {
-    if (g_app_steam_path.empty()) return;
+    if (g_app_steam_path.empty()) { LogPush("Папка Lua недоступна: Steam не найден", true); return; }
     fs::path lua = fs::path(g_app_steam_path) / "config" / "lua";
     std::error_code ec; fs::create_directories(lua, ec);
+    LogPush("Открываю папку: " + lua.string());
     ShellExecuteW(nullptr, L"open", lua.wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 static bool HttpGetBinary(const std::string& url, std::vector<unsigned char>& out) {
@@ -347,7 +655,7 @@ static bool HttpGetBinary(const std::string& url, std::vector<unsigned char>& ou
     uc.lpszUrlPath = path; uc.dwUrlPathLength = 2047;
     if (!WinHttpCrackUrl(wurl.c_str(), 0, 0, &uc)) return false;
     bool https = (uc.nScheme == INTERNET_SCHEME_HTTPS);
-    HINTERNET hSession = WinHttpOpen(L"SLT/9.5", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    HINTERNET hSession = WinHttpOpen(L"SLT/10.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSession) return false;
     HINTERNET hConnect = WinHttpConnect(hSession, host, uc.nPort, 0);
     if (!hConnect) { WinHttpCloseHandle(hSession); return false; }
@@ -381,509 +689,19 @@ static bool DownloadToFile(const std::string& url, const std::string& file) {
 }
 
 // ============================================================
-//  Достижения
-//  rarity: 0 = обычное, 1 = редкое, 2 = эпическое, 3 = легендарное
-//  secret: true — скрытое до получения
-// ============================================================
-struct Achievement {
-    std::string id, title, desc;
-    int rarity = 0;
-    bool secret = false;
-    bool done = false;
-};
-static std::vector<Achievement> g_achievements;
-
-static void InitAchievements() {
-    g_achievements = {
-        // === Основные ===
-        {"first_install","Первый шаг","Установите первую игру",0,false},
-        {"ten_installs","Коллекционер","Установите 10 игр",0,false},
-        {"fifty_installs","Маньяк","Установите 50 игр",1,false},
-        {"hundred_installs","Легенда","Установите 100 игр",2,false},
-        {"fav_first","Ценитель","Добавьте первую игру в избранное",0,false},
-        {"fav_ten","Куратор","10 игр в избранном",0,false},
-        {"fav_fifty","Архивариус","50 игр в избранном",1,false},
-        {"random_use","Рулетка","Воспользуйтесь случайной игрой",0,false},
-        {"random_ten","Азартный","10 раз случайная игра",0,false},
-        {"copy_id","Скопируй это","Скопируйте AppID игры",0,false},
-        {"copy_hundred","Ксерокс","Скопируйте 100 AppID",1,false},
-        {"cancel_once","Передумал","Отмените загрузку",0,false},
-        {"cancel_ten","Непостоянный","Отмените 10 загрузок",1,false},
-        {"theme_change","Стилист","Смените тему оформления",0,false},
-        {"fx_change","Декоратор","Смените фоновую анимацию",0,false},
-        {"snow_on","Зимняя сказка","Включите снег",0,false},
-        {"rain_on","Дождливый день","Включите дождь",0,false},
-        {"leaves_on","Осеннее настроение","Включите листья",0,false},
-        {"weather_all","Всесезонье","Включите все погодные эффекты",1,false},
-        {"night_owl","Полуночник","Запустите приложение после 0:00",1,false},
-        {"early_bird","Ранняя птичка","Запустите приложение до 6:00",1,false},
-        {"gradient","Художник","Создайте свой градиент",1,false},
-        {"all_tabs","Исследователь","Посетите все вкладки",0,false},
-
-        // === Мини-игры — общие ===
-        {"mini_first","Первый заход","Запустите любую мини-игру",0,false},
-        {"mini_ten","Игрок","Сыграйте 10 раз в мини-игры",0,false},
-        {"mini_fifty","Заядлый","Сыграйте 50 раз в мини-игры",1,false},
-        {"mini_hundred","Досуг","Сыграйте 100 раз в мини-игры",2,false},
-        {"mini_master","Мастер досуга","Получите 5 звёзд в 5 разных мини-играх",2,false},
-        {"mini_legend","Легенда мини-игр","Все мини-игры — 5 звёзд",3,false},
-
-        // === Мини-игры — индивидуальные ===
-        {"react_rookie","Рефлекс","Пройдите игру «Реакция»",0,false},
-        {"react_pro","Быстрее ветра","Реакция < 250 мс",1,false},
-        {"react_god","Молниеносный","Реакция < 150 мс",3,false},
-        {"memory_rookie","Мнемоник","Пройдите «Память»",0,false},
-        {"memory_pro","Слонишка","Запомните 10 пар",1,false},
-        {"memory_god","Фотопамять","Запомните 20 пар",3,false},
-        {"clicker_100","Кликер-100","100 кликов за 10 секунд",0,false},
-        {"clicker_200","Кликер-бог","200 кликов за 10 секунд",2,false},
-        {"math_rookie","Считало","10 правильных примеров подряд",0,false},
-        {"math_pro","Математик","30 правильных примеров подряд",1,false},
-        {"math_god","Эйнштейн","50 правильных примеров подряд",3,false},
-        {"snake_rookie","Змейка-новичок","Съешьте 10 яблок",0,false},
-        {"snake_pro","Змейка-про","Съешьте 30 яблок",1,false},
-        {"snake_god","Змейка-бог","Съешьте 60 яблок",3,false},
-        {"color_rookie","Цветовик","Пройдите «Цвет»",0,false},
-        {"color_pro","Оттенок","20 правильных цветов подряд",1,false},
-        {"typing_rookie","Печатник","Скорость > 30 WPM",0,false},
-        {"typing_pro","Машинистка","Скорость > 60 WPM",1,false},
-        {"typing_god","Стенографист","Скорость > 100 WPM",3,false},
-        {"aim_rookie","Снайпер","10 попаданий подряд",0,false},
-        {"aim_pro","Стрелок","30 попаданий подряд",1,false},
-        {"aim_god","Дедшот","60 попаданий подряд",3,false},
-
-        // === Секретные (описание скрыто до получения) ===
-        {"secret_hacker","Хакер","...",3,true},
-        {"secret_philosopher","Философ","...",3,true},
-        {"secret_pacifist","Пацифист","...",3,true},
-        {"secret_collector","Коллекционер секретов","...",3,true},
-        {"secret_420","Ничего не подозреваю","...",3,true},
-    };
-}
-
-static void UnlockAchievement(const std::string& id) {
-    for (auto& a : g_achievements) {
-        if (a.id == id && !a.done) {
-            a.done = true;
-            std::string txt = a.secret ? ("Секрет: " + a.title) : ("Достижение: " + a.title);
-            LogPush("[" + std::string(a.secret ? "Секрет" : "Достижение") + "] " + a.title);
-            PushAchievementToast(txt);
-            SaveSettings();
-        }
-    }
-}
-
-// ============================================================
-//  Счётчики
-// ============================================================
-static int g_stat_installs = 0, g_stat_fav = 0, g_stat_random = 0, g_stat_copy = 0;
-static int g_stat_cancel = 0, g_stat_theme = 0, g_stat_fx = 0, g_stat_weather = 0;
-static int g_stat_mini_played = 0;
-static float g_fx_time = 0.0f;
-
-// ============================================================
-//  Уровень
-// ============================================================
-static int g_xp = 0;
-
-static int XPForLevel(int lvl) { return 100 + lvl * 50; }
-
-static int LevelFromXP(int xp) {
-    int lvl = 1, need = XPForLevel(1), acc = 0;
-    while (xp >= acc + need && lvl < 100) { acc += need; lvl++; need = XPForLevel(lvl); }
-    return lvl;
-}
-static int XPIntoLevel(int xp) {
-    int lvl = 1, need = XPForLevel(1), acc = 0;
-    while (xp >= acc + need && lvl < 100) { acc += need; lvl++; need = XPForLevel(lvl); }
-    return xp - acc;
-}
-static int XPRemaining(int xp) {
-    int lvl = LevelFromXP(xp);
-    return XPForLevel(lvl);
-}
-static const char* LevelTitle(int lvl) {
-    if (lvl <= 2) return "Новичок";
-    if (lvl <= 5) return "Любитель";
-    if (lvl <= 10) return "Знаток";
-    if (lvl <= 20) return "Коллекционер";
-    if (lvl <= 40) return "Мастер";
-    if (lvl <= 60) return "Гуру";
-    if (lvl <= 80) return "Легенда";
-    return "Мифический";
-}
-static void AddXP(int amount, const std::string& reason = "") {
-    if (amount <= 0) return;
-    int old_lvl = LevelFromXP(g_xp);
-    g_xp += amount;
-    int new_lvl = LevelFromXP(g_xp);
-    if (new_lvl > old_lvl) {
-        PushToast("Новый уровень: " + std::to_string(new_lvl) + " — " + LevelTitle(new_lvl));
-        LogPush("Уровень повышен до " + std::to_string(new_lvl));
-    }
-    if (!reason.empty()) PushToast("+" + std::to_string(amount) + " XP · " + reason);
-    SaveSettings();
-}
-
-// ============================================================
-//  Тосты
-// ============================================================
-struct MiniToast { std::string text; float timer = 0.0f; bool is_achievement = false; };
-static std::deque<MiniToast> g_toasts;
-
-static void PushToast(const std::string& t) {
-    MiniToast tt; tt.text = t; tt.timer = 0.0f; tt.is_achievement = false;
-    g_toasts.push_back(tt);
-    if (g_toasts.size() > 5) g_toasts.pop_front();
-}
-static void PushAchievementToast(const std::string& t) {
-    MiniToast tt; tt.text = t; tt.timer = 0.0f; tt.is_achievement = true;
-    g_toasts.push_back(tt);
-    if (g_toasts.size() > 5) g_toasts.pop_front();
-}
-
-// ============================================================
-//  Мини-игры
-// ============================================================
-enum class MiniGame { None = 0, Reaction, Memory, Clicker, Math, Snake, Color, Typing, Aim, Count };
-
-struct MiniScore {
-    int best = 0;
-    int stars = 0;
-    int plays = 0;
-};
-
-struct MiniGameState {
-    MiniGame current = MiniGame::None;
-    bool running = false;
-    bool finished = false;
-    float timer = 0.0f;
-    float time_limit = 10.0f;
-    int score = 0;
-    int best_session = 0;
-    std::string message;
-    // Данные конкретной игры
-    float react_start = 0.0f;
-    bool react_ready = false;
-    float react_last = 0.0f;
-    // Memory
-    std::vector<int> mem_cards;
-    std::vector<bool> mem_flipped;
-    std::vector<bool> mem_done;
-    int mem_flip_a = -1, mem_flip_b = -1;
-    float mem_flash_t = 0.0f;
-    int mem_pairs = 0;
-    // Clicker
-    int clicks = 0;
-    // Math
-    int math_a = 0, math_b = 0, math_answer = 0;
-    int math_streak = 0;
-    char math_input[8] = "";
-    // Snake
-    std::vector<ImVec2> snake;
-    ImVec2 snake_dir = ImVec2(1, 0);
-    std::vector<ImVec2> apples;
-    float snake_move_t = 0.0f;
-    int snake_grid = 20;
-    // Color
-    float col_target_r = 0.5f, col_target_g = 0.5f, col_target_b = 0.5f;
-    float col_guess_r = 0.5f, col_guess_g = 0.5f, col_guess_b = 0.5f;
-    int col_streak = 0;
-    // Typing
-    std::string type_text;
-    std::string type_target;
-    int type_correct = 0, type_wrong = 0;
-    float type_start = 0.0f;
-    // Aim
-    std::vector<ImVec2> aim_targets;
-    float aim_spawn_t = 0.0f;
-    int aim_hits = 0, aim_misses = 0;
-};
-
-static MiniGameState g_mini;
-static MiniScore g_mini_scores[(int)MiniGame::Count];
-
-static const char* MiniName(MiniGame g) {
-    switch (g) {
-    case MiniGame::Reaction: return "Реакция";
-    case MiniGame::Memory:   return "Память";
-    case MiniGame::Clicker:  return "Кликер";
-    case MiniGame::Math:     return "Математика";
-    case MiniGame::Snake:    return "Змейка";
-    case MiniGame::Color:    return "Цвет";
-    case MiniGame::Typing:   return "Печать";
-    case MiniGame::Aim:      return "Снайпер";
-    default: return "—";
-    }
-}
-static const char* MiniDesc(MiniGame g) {
-    switch (g) {
-    case MiniGame::Reaction: return "Нажми как можно быстрее после сигнала";
-    case MiniGame::Memory:   return "Найди все пары карточек";
-    case MiniGame::Clicker:  return "Как можно больше кликов за 10 секунд";
-    case MiniGame::Math:     return "Решай примеры на скорость";
-    case MiniGame::Snake:    return "Собери как можно больше яблок";
-    case MiniGame::Color:    return "Угадай цвет по оттенку";
-    case MiniGame::Typing:   return "Печатай текст на скорость";
-    case MiniGame::Aim:      return "Кликни по всем мишеням";
-    default: return "";
-    }
-}
-
-static void ComputeStars(MiniGame game, int score, int& stars) {
-    stars = 0;
-    switch (game) {
-    case MiniGame::Reaction:  // score в миллисекундах, меньше = лучше
-        if (score > 0 && score < 500) stars = 1;
-        if (score > 0 && score < 300) stars = 2;
-        if (score > 0 && score < 250) stars = 3;
-        if (score > 0 && score < 200) stars = 4;
-        if (score > 0 && score < 150) stars = 5;
-        break;
-    case MiniGame::Memory:
-        if (score >= 4) stars = 1;
-        if (score >= 8) stars = 2;
-        if (score >= 10) stars = 3;
-        if (score >= 15) stars = 4;
-        if (score >= 20) stars = 5;
-        break;
-    case MiniGame::Clicker:
-        if (score >= 50) stars = 1;
-        if (score >= 100) stars = 2;
-        if (score >= 150) stars = 3;
-        if (score >= 200) stars = 4;
-        if (score >= 250) stars = 5;
-        break;
-    case MiniGame::Math:
-        if (score >= 10) stars = 1;
-        if (score >= 20) stars = 2;
-        if (score >= 30) stars = 3;
-        if (score >= 40) stars = 4;
-        if (score >= 50) stars = 5;
-        break;
-    case MiniGame::Snake:
-        if (score >= 10) stars = 1;
-        if (score >= 20) stars = 2;
-        if (score >= 30) stars = 3;
-        if (score >= 45) stars = 4;
-        if (score >= 60) stars = 5;
-        break;
-    case MiniGame::Color:
-        if (score >= 5) stars = 1;
-        if (score >= 10) stars = 2;
-        if (score >= 15) stars = 3;
-        if (score >= 20) stars = 4;
-        if (score >= 25) stars = 5;
-        break;
-    case MiniGame::Typing:
-        if (score >= 20) stars = 1;
-        if (score >= 30) stars = 2;
-        if (score >= 45) stars = 3;
-        if (score >= 60) stars = 4;
-        if (score >= 80) stars = 5;
-        break;
-    case MiniGame::Aim:
-        if (score >= 10) stars = 1;
-        if (score >= 20) stars = 2;
-        if (score >= 30) stars = 3;
-        if (score >= 45) stars = 4;
-        if (score >= 60) stars = 5;
-        break;
-    default: break;
-    }
-}
-
-static void MiniFinish() {
-    if (!g_mini.running) return;
-    g_mini.running = false;
-    g_mini.finished = true;
-
-    int score = g_mini.score;
-    MiniGame g = g_mini.current;
-    int idx = (int)g;
-
-    g_mini_scores[idx].plays++;
-    g_stat_mini_played++;
-
-    int stars = 0;
-    ComputeStars(g, score, stars);
-    if (stars > g_mini_scores[idx].stars) g_mini_scores[idx].stars = stars;
-    if (g == MiniGame::Reaction) {
-        // меньше = лучше
-        if (g_mini_scores[idx].best == 0 || (score > 0 && score < g_mini_scores[idx].best))
-            g_mini_scores[idx].best = score;
-    }
-    else {
-        if (score > g_mini_scores[idx].best) g_mini_scores[idx].best = score;
-    }
-
-    g_mini.message = std::string("Результат: ") + std::to_string(score) +
-        (g == MiniGame::Reaction ? " мс" : " очков") +
-        "  ·  Звёзд: " + std::to_string(stars);
-
-    // XP и достижения
-    AddXP(5 + stars * 5, "мини-игра");
-
-    if (g_stat_mini_played >= 1) UnlockAchievement("mini_first");
-    if (g_stat_mini_played >= 10) UnlockAchievement("mini_ten");
-    if (g_stat_mini_played >= 50) UnlockAchievement("mini_fifty");
-    if (g_stat_mini_played >= 100) UnlockAchievement("mini_hundred");
-
-    int five_star_count = 0;
-    for (int i = 1; i < (int)MiniGame::Count; i++)
-        if (g_mini_scores[i].stars >= 5) five_star_count++;
-    if (five_star_count >= 5) UnlockAchievement("mini_master");
-    if (five_star_count >= (int)MiniGame::Count - 1) UnlockAchievement("mini_legend");
-
-    // Индивидуальные
-    switch (g) {
-    case MiniGame::Reaction:
-        UnlockAchievement("react_rookie");
-        if (score > 0 && score < 250) UnlockAchievement("react_pro");
-        if (score > 0 && score < 150) UnlockAchievement("react_god");
-        break;
-    case MiniGame::Memory:
-        UnlockAchievement("memory_rookie");
-        if (score >= 10) UnlockAchievement("memory_pro");
-        if (score >= 20) UnlockAchievement("memory_god");
-        break;
-    case MiniGame::Clicker:
-        if (score >= 100) UnlockAchievement("clicker_100");
-        if (score >= 200) UnlockAchievement("clicker_200");
-        break;
-    case MiniGame::Math:
-        if (score >= 10) UnlockAchievement("math_rookie");
-        if (score >= 30) UnlockAchievement("math_pro");
-        if (score >= 50) UnlockAchievement("math_god");
-        break;
-    case MiniGame::Snake:
-        if (score >= 10) UnlockAchievement("snake_rookie");
-        if (score >= 30) UnlockAchievement("snake_pro");
-        if (score >= 60) UnlockAchievement("snake_god");
-        break;
-    case MiniGame::Color:
-        UnlockAchievement("color_rookie");
-        if (score >= 20) UnlockAchievement("color_pro");
-        break;
-    case MiniGame::Typing:
-        if (score >= 30) UnlockAchievement("typing_rookie");
-        if (score >= 60) UnlockAchievement("typing_pro");
-        if (score >= 100) UnlockAchievement("typing_god");
-        break;
-    case MiniGame::Aim:
-        if (score >= 10) UnlockAchievement("aim_rookie");
-        if (score >= 30) UnlockAchievement("aim_pro");
-        if (score >= 60) UnlockAchievement("aim_god");
-        break;
-    default: break;
-    }
-
-    SaveSettings();
-    PushToast(std::string(MiniName(g)) + ": +" + std::to_string(5 + stars * 5) + " XP");
-}
-
-static void MiniStart(MiniGame g) {
-    g_mini = MiniGameState{};
-    g_mini.current = g;
-    g_mini.running = true;
-    g_mini.finished = false;
-    g_mini.timer = 0.0f;
-    g_mini.score = 0;
-
-    std::mt19937 rng((unsigned)std::chrono::system_clock::now().time_since_epoch().count());
-
-    switch (g) {
-    case MiniGame::Reaction:
-        g_mini.time_limit = 5.0f;
-        g_mini.react_ready = false;
-        g_mini.react_start = 0.0f;
-        break;
-    case MiniGame::Memory: {
-        g_mini.time_limit = 999.0f;
-        int pairs = 10;
-        g_mini.mem_pairs = pairs;
-        g_mini.mem_cards.resize(pairs * 2);
-        g_mini.mem_flipped.assign(pairs * 2, false);
-        g_mini.mem_done.assign(pairs * 2, false);
-        for (int i = 0; i < pairs; i++) { g_mini.mem_cards[i * 2] = i; g_mini.mem_cards[i * 2 + 1] = i; }
-        std::shuffle(g_mini.mem_cards.begin(), g_mini.mem_cards.end(), rng);
-        break;
-    }
-    case MiniGame::Clicker:
-        g_mini.time_limit = 10.0f;
-        g_mini.clicks = 0;
-        break;
-    case MiniGame::Math: {
-        g_mini.time_limit = 30.0f;
-        std::uniform_int_distribution<int> d(1, 20);
-        g_mini.math_a = d(rng);
-        g_mini.math_b = d(rng);
-        g_mini.math_answer = g_mini.math_a + g_mini.math_b;
-        g_mini.math_streak = 0;
-        break;
-    }
-    case MiniGame::Snake:
-        g_mini.time_limit = 999.0f;
-        g_mini.snake_grid = 20;
-        g_mini.snake.clear();
-        g_mini.snake.push_back(ImVec2(10, 10));
-        g_mini.snake_dir = ImVec2(1, 0);
-        g_mini.apples.clear();
-        g_mini.apples.push_back(ImVec2((float)(rng() % 20), (float)(rng() % 20)));
-        g_mini.snake_move_t = 0.0f;
-        break;
-    case MiniGame::Color: {
-        g_mini.time_limit = 20.0f;
-        std::uniform_real_distribution<float> d(0.1f, 0.9f);
-        g_mini.col_target_r = d(rng); g_mini.col_target_g = d(rng); g_mini.col_target_b = d(rng);
-        g_mini.col_guess_r = 0.5f; g_mini.col_guess_g = 0.5f; g_mini.col_guess_b = 0.5f;
-        g_mini.col_streak = 0;
-        break;
-    }
-    case MiniGame::Typing: {
-        g_mini.time_limit = 30.0f;
-        const char* phrases[] = {
-            "The quick brown fox jumps over the lazy dog",
-            "Pack my box with five dozen liquor jugs",
-            "How vexingly quick daft zebras jump",
-            "The five boxing wizards jump quickly",
-            "Sphinx of black quartz judge my vow",
-        };
-        std::uniform_int_distribution<int> d(0, 4);
-        g_mini.type_target = phrases[d(rng)];
-        g_mini.type_text.clear();
-        g_mini.type_correct = 0;
-        g_mini.type_wrong = 0;
-        g_mini.type_start = 0.0f;
-        break;
-    }
-    case MiniGame::Aim:
-        g_mini.time_limit = 20.0f;
-        g_mini.aim_targets.clear();
-        g_mini.aim_spawn_t = 0.0f;
-        g_mini.aim_hits = 0;
-        g_mini.aim_misses = 0;
-        break;
-    default: break;
-    }
-}
-
-
-// ============================================================
 //  AppState
 // ============================================================
 struct GameEntry {
     std::string appid, name, header_image;
     std::vector<std::string> tags;
     bool nsfw = false;
-    bool favorite = false;
     ID3D11ShaderResourceView* texture = nullptr;
     bool loading = false, load_failed = false;
     float fade_in = 0.0f;
     float open_time = -1.0f;
     bool installed = false;
-    float star_hover_t = 0.0f;
     float copy_hover_t = 0.0f;
+    float steam_hover_t = 0.0f;
 };
 
 struct PendingTexture { std::string appid; int w = 0, h = 0; std::vector<unsigned char> pixels; };
@@ -905,8 +723,6 @@ struct AppState {
     static const int kGamesPerPage = 20;
     static const int kGridCols = 5;
     static const int kGridRows = 4;
-
-    int fav_page = 0;
 
     bool random_mode = false;
     int random_index = -1;
@@ -936,8 +752,7 @@ struct AppState {
     float success_alpha = 0.0f, success_timer = 0.0f, overlay_alpha = 0.0f;
 
     int current_tab = 0, prev_tab = 0;
-    float tab_fade = 1.0f, underline_x = 0.0f;
-    int underline_initialized = 0;
+    float tab_fade = 1.0f;
     float time_accum = 0.0f, app_open_anim = 0.0f;
     int notifications_count = 0;
 
@@ -953,6 +768,10 @@ struct AppState {
     bool IsBusy() const { return progress_mode.load() != (int)ProgressMode::None; }
 };
 static AppState g_app;
+
+static bool IsInputBlocked() {
+    return g_app.IsBusy() || g_app.success_visible;
+}
 
 static bool g_tag_combo_open = false;
 static bool g_tag_combo_just_picked = false;
@@ -979,34 +798,8 @@ static void SaveSettings() {
         j["fx_snow"] = g_fx_snow;
         j["fx_rain"] = g_fx_rain;
         j["fx_leaves"] = g_fx_leaves;
-        j["xp"] = g_xp;
         j["custom_a"] = { g_custom_color_a[0], g_custom_color_a[1], g_custom_color_a[2], g_custom_color_a[3] };
         j["custom_b"] = { g_custom_color_b[0], g_custom_color_b[1], g_custom_color_b[2], g_custom_color_b[3] };
-        j["stat_installs"] = g_stat_installs;
-        j["stat_fav"] = g_stat_fav;
-        j["stat_random"] = g_stat_random;
-        j["stat_copy"] = g_stat_copy;
-        j["stat_cancel"] = g_stat_cancel;
-        j["stat_theme"] = g_stat_theme;
-        j["stat_fx"] = g_stat_fx;
-        j["stat_weather"] = g_stat_weather;
-        j["stat_mini_played"] = g_stat_mini_played;
-
-        // Мини-игры
-        json jm = json::array();
-        for (int i = 1; i < (int)MiniGame::Count; i++) {
-            json e;
-            e["best"] = g_mini_scores[i].best;
-            e["stars"] = g_mini_scores[i].stars;
-            e["plays"] = g_mini_scores[i].plays;
-            jm.push_back(e);
-        }
-        j["mini_scores"] = jm;
-
-        j["favorites"] = json::array();
-        for (auto& g : g_app.all_games) if (g.favorite) j["favorites"].push_back(g.appid);
-        j["achievements"] = json::array();
-        for (auto& a : g_achievements) if (a.done) j["achievements"].push_back(a.id);
 
         std::ofstream f(GetSettingsPath());
         if (f.is_open()) f << j.dump(2);
@@ -1024,51 +817,23 @@ static void LoadSettings() {
         if (j.contains("fx_snow")) g_fx_snow = j["fx_snow"].get<bool>();
         if (j.contains("fx_rain")) g_fx_rain = j["fx_rain"].get<bool>();
         if (j.contains("fx_leaves")) g_fx_leaves = j["fx_leaves"].get<bool>();
-        if (j.contains("xp")) g_xp = j["xp"].get<int>();
-        if (j.contains("stat_installs")) g_stat_installs = j["stat_installs"].get<int>();
-        if (j.contains("stat_fav")) g_stat_fav = j["stat_fav"].get<int>();
-        if (j.contains("stat_random")) g_stat_random = j["stat_random"].get<int>();
-        if (j.contains("stat_copy")) g_stat_copy = j["stat_copy"].get<int>();
-        if (j.contains("stat_cancel")) g_stat_cancel = j["stat_cancel"].get<int>();
-        if (j.contains("stat_theme")) g_stat_theme = j["stat_theme"].get<int>();
-        if (j.contains("stat_fx")) g_stat_fx = j["stat_fx"].get<int>();
-        if (j.contains("stat_weather")) g_stat_weather = j["stat_weather"].get<int>();
-        if (j.contains("stat_mini_played")) g_stat_mini_played = j["stat_mini_played"].get<int>();
-        if (j.contains("mini_scores") && j["mini_scores"].is_array()) {
-            auto& arr = j["mini_scores"];
-            for (int i = 1; i < (int)MiniGame::Count && (i - 1) < (int)arr.size(); i++) {
-                auto& e = arr[i - 1];
-                g_mini_scores[i].best = e.value("best", 0);
-                g_mini_scores[i].stars = e.value("stars", 0);
-                g_mini_scores[i].plays = e.value("plays", 0);
-            }
-        }
         if (j.contains("custom_a") && j["custom_a"].is_array() && j["custom_a"].size() == 4)
             for (int i = 0; i < 4; ++i) g_custom_color_a[i] = j["custom_a"][i].get<float>();
         if (j.contains("custom_b") && j["custom_b"].is_array() && j["custom_b"].size() == 4)
             for (int i = 0; i < 4; ++i) g_custom_color_b[i] = j["custom_b"][i].get<float>();
-        if (j.contains("favorites") && j["favorites"].is_array()) {
-            std::unordered_set<std::string> favs;
-            for (auto& v : j["favorites"]) favs.insert(v.get<std::string>());
-            for (auto& g : g_app.all_games) if (favs.count(g.appid)) g.favorite = true;
-        }
-        if (j.contains("achievements") && j["achievements"].is_array()) {
-            std::unordered_set<std::string> achs;
-            for (auto& v : j["achievements"]) achs.insert(v.get<std::string>());
-            for (auto& a : g_achievements) if (achs.count(a.id)) a.done = true;
-        }
     }
     catch (...) {}
 }
 
 // ============================================================
-//  Стиль
+//  Стиль (все скругления = 0)
 // ============================================================
 static void ApplyStyle() {
     ThemeColors t = GetTheme();
     ImGuiStyle& s = ImGui::GetStyle();
-    s.WindowRounding = 0.0f; s.ChildRounding = 10.0f; s.FrameRounding = 8.0f;
-    s.PopupRounding = 10.0f; s.ScrollbarRounding = 10.0f; s.GrabRounding = 8.0f;
+    s.WindowRounding = 0.0f; s.ChildRounding = 0.0f; s.FrameRounding = 0.0f;
+    s.PopupRounding = 0.0f; s.ScrollbarRounding = 0.0f; s.GrabRounding = 0.0f;
+    s.TabRounding = 0.0f;
     s.WindowBorderSize = 0.0f; s.FrameBorderSize = 0.0f; s.PopupBorderSize = 1.0f;
     s.ItemSpacing = ImVec2(12, 10); s.FramePadding = ImVec2(12, 8);
     ImVec4* c = s.Colors;
@@ -1303,18 +1068,19 @@ static void DownloadAndDecodeWorker(std::string url, std::string appid) {
 static void RequestImageLoad(GameEntry& g) {
     if (g.texture || g.loading || g.load_failed) return;
     if (g.header_image.empty()) return;
-    if (g_app.active_downloads.load() >= 6) return;
+    if (g_app.active_downloads.load() >= 12) return;
     g.loading = true; g_app.active_downloads++;
     std::thread(DownloadAndDecodeWorker, g.header_image, g.appid).detach();
 }
 static void ProcessPendingTextures() {
     int done = 0;
-    while (done < 3) {
+    while (done < 8) {
         PendingTexture pt;
         {
             std::lock_guard<std::mutex> lock(g_app.pending_mutex); if (g_app.pending_textures.empty()) break;
             pt = std::move(g_app.pending_textures.front()); g_app.pending_textures.pop_front();
         }
+        if (pt.pixels.empty()) { done++; continue; }
         D3D11_TEXTURE2D_DESC desc = {};
         desc.Width = pt.w; desc.Height = pt.h; desc.MipLevels = 1; desc.ArraySize = 1;
         desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; desc.SampleDesc.Count = 1;
@@ -1358,6 +1124,7 @@ static void RebuildFiltered() {
         if (name.find(q) != std::string::npos || g.appid.find(q) != std::string::npos) g_app.filtered.push_back(i);
     }
     g_app.page = 0; g_app.prev_page = 0; g_app.page_switch_t = 1.0f;
+    LogPush("Фильтр: '" + q + "' | тег: " + (tag_is_all ? "все" : tag_value) + " | найдено: " + std::to_string(g_app.filtered.size()));
 }
 
 // ============================================================
@@ -1387,20 +1154,31 @@ static void RefreshInstalledFiles() {
     }
 }
 static void DeleteInstalled(const std::string& appid) {
-    if (g_app_steam_path.empty()) return;
+    if (g_app_steam_path.empty()) { LogPush("Удаление невозможно: Steam не найден", true); return; }
     fs::path lua = fs::path(g_app_steam_path) / "config" / "lua";
     fs::path depot = fs::path(g_app_steam_path) / "depotcache";
     std::error_code ec;
-    if (fs::exists(lua)) for (auto& p : fs::directory_iterator(lua)) if (p.path().stem().string() == appid) fs::remove(p.path(), ec);
-    if (fs::exists(depot)) for (auto& p : fs::directory_iterator(depot)) if (p.path().stem().string() == appid) fs::remove(p.path(), ec);
+    int removed_lua = 0, removed_depot = 0;
+
+    if (fs::exists(lua)) for (auto& p : fs::directory_iterator(lua)) if (p.path().stem().string() == appid) {
+        LogPush("Удаляю: " + p.path().string());
+        fs::remove(p.path(), ec);
+        if (!ec) removed_lua++;
+    }
+    if (fs::exists(depot)) for (auto& p : fs::directory_iterator(depot)) if (p.path().stem().string() == appid) {
+        LogPush("Удаляю: " + p.path().string());
+        fs::remove(p.path(), ec);
+        if (!ec) removed_depot++;
+    }
+    LogPush("Удаление AppID " + appid + ": lua=" + std::to_string(removed_lua) + ", depot=" + std::to_string(removed_depot));
     RefreshInstalledFiles(); RefreshInstalledFlags();
-    LogPush("Удалена игра AppID: " + appid);
-    AddXP(2, "удаление");
 }
 static int CopyLuaFromDir(const std::string& extract_dir) {
     fs::path lua_dst = fs::path(g_app_steam_path) / "config" / "lua";
     fs::path depot_dst = fs::path(g_app_steam_path) / "depotcache";
     fs::create_directories(lua_dst); fs::create_directories(depot_dst);
+    LogPush("Копирование в lua: " + lua_dst.string());
+    LogPush("Копирование в depotcache: " + depot_dst.string());
     int copied = 0;
     for (auto& p : fs::recursive_directory_iterator(extract_dir)) {
         if (!p.is_regular_file()) continue;
@@ -1408,7 +1186,10 @@ static int CopyLuaFromDir(const std::string& extract_dir) {
         if (ext == ".lua" || ext == ".manifest") {
             std::error_code ec;
             fs::copy_file(p.path(), lua_dst / p.path().filename(), fs::copy_options::overwrite_existing, ec);
+            if (ec) LogPush("Не удалось скопировать " + p.path().string() + " -> lua: " + ec.message(), true);
             fs::copy_file(p.path(), depot_dst / p.path().filename(), fs::copy_options::overwrite_existing, ec);
+            if (ec) LogPush("Не удалось скопировать " + p.path().string() + " -> depotcache: " + ec.message(), true);
+            LogPush("Скопирован файл: " + p.path().filename().string());
             copied++;
         }
     }
@@ -1434,13 +1215,25 @@ static void DownloadManifestAsync(std::string appid, std::string name) {
         std::string zip_path = std::string(temp_path) + "SLT_" + appid + ".zip";
         std::string extract_dir = std::string(temp_path) + "SLT_" + appid;
 
-        auto cleanup_partial = [&]() { std::error_code ec; fs::remove(zip_path, ec); fs::remove_all(extract_dir, ec); };
+        LogPush("URL: " + url);
+        LogPush("Временный ZIP: " + zip_path);
+        LogPush("Папка распаковки: " + extract_dir);
+
+        auto cleanup_partial = [&]() {
+            std::error_code ec;
+            LogPush("Очистка временных: " + zip_path + ", " + extract_dir);
+            fs::remove(zip_path, ec); fs::remove_all(extract_dir, ec);
+            };
 
         g_app.progress_target = 0.15f;
         bool ok = DownloadToFile(url, zip_path);
+        if (ok) {
+            std::error_code ec;
+            auto sz = fs::file_size(zip_path, ec);
+            if (!ec) LogPush("ZIP сохранён: " + std::to_string(sz) + " байт");
+        }
         if (g_app.cancel_requested) {
             cleanup_partial(); LogPush("Загрузка отменена: " + name, true);
-            g_stat_cancel++; SaveSettings();
             g_app.progress_mode.store((int)ProgressMode::None); g_app.progress_target = 0.0f; g_app.progress_display = 0.0f;
             return;
         }
@@ -1452,33 +1245,26 @@ static void DownloadManifestAsync(std::string appid, std::string name) {
         LogPush("Скачано: " + name + ", распаковка...");
 
         std::error_code ec; fs::remove_all(extract_dir, ec);
-        std::string cmd = "powershell -NoProfile -Command \"Expand-Archive -Force -Path '" + zip_path + "' -DestinationPath '" + extract_dir + "'\"";
-        RunHidden(cmd);
+        // встроенный распаковщик без PowerShell
+        bool unzip_ok = zipmin::ExtractAll(zip_path, extract_dir);
+        if (!unzip_ok) LogPush("Встроенный распаковщик не смог распаковать ZIP", true);
 
         if (g_app.cancel_requested) {
             cleanup_partial(); LogPush("Загрузка отменена: " + name, true);
-            g_stat_cancel++; SaveSettings();
             g_app.progress_mode.store((int)ProgressMode::None); g_app.progress_target = 0.0f; g_app.progress_display = 0.0f; return;
         }
         g_app.progress_target = 0.88f;
         int copied = CopyLuaFromDir(extract_dir);
-        LogPush("Установлено файлов: " + std::to_string(copied) + " для " + name);
+        LogPush("Скопировано файлов: " + std::to_string(copied) + " для " + name);
+        if (copied == 0) LogPush("В архиве не найдено ни одного .lua или .manifest!", true);
         cleanup_partial();
 
         g_app.progress_target = 1.0f;
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
         RefreshInstalledFlags(); RefreshInstalledFiles();
 
-        g_stat_installs++; SaveSettings();
-        AddXP(10, "установка");
-        if (g_stat_installs >= 1) UnlockAchievement("first_install");
-        if (g_stat_installs >= 10) UnlockAchievement("ten_installs");
-        if (g_stat_installs >= 50) UnlockAchievement("fifty_installs");
-        if (g_stat_installs >= 100) UnlockAchievement("hundred_installs");
-
         g_app.progress_mode.store((int)ProgressMode::None); g_app.progress_target = 0.0f; g_app.progress_display = 0.0f;
         ShowSuccess();
-        PushToast("Установлено: " + name);
         }).detach();
 }
 
@@ -1492,6 +1278,7 @@ static void CancelCurrentDownload() {
     g_app.progress_target = 0.01f; g_app.progress_display = 0.0f;
 
     std::thread([appid]() {
+        LogPush("Отмена загрузки AppID " + appid);
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
         g_app.progress_target = 0.35f;
         fs::path lua = fs::path(g_app_steam_path) / "config" / "lua";
@@ -1507,8 +1294,7 @@ static void CancelCurrentDownload() {
             g_app.progress_target = 0.35f + 0.65f * ((float)(i + 1) / total);
             std::this_thread::sleep_for(std::chrono::milliseconds(150));
         }
-        LogPush("Отмена: удалены файлы AppID " + appid, true);
-        g_stat_cancel++; SaveSettings();
+        LogPush("Отмена: удалено файлов " + std::to_string(total) + " для AppID " + appid);
         RefreshInstalledFiles(); RefreshInstalledFlags();
         g_app.progress_target = 1.0f; std::this_thread::sleep_for(std::chrono::milliseconds(400));
         g_app.progress_mode.store((int)ProgressMode::None); g_app.progress_target = 0.0f; g_app.progress_display = 0.0f;
@@ -1517,18 +1303,20 @@ static void CancelCurrentDownload() {
 }
 
 static void InstallZipFile(const std::string& zip_path) {
-    if (g_app_steam_path.empty()) { LogPush("Steam не найден", true); return; }
+    if (g_app_steam_path.empty()) { LogPush("Установка ZIP невозможна: Steam не найден", true); return; }
+    LogPush("Установка ZIP вручную: " + zip_path);
     char temp_path[MAX_PATH]; GetTempPathA(MAX_PATH, temp_path);
     std::string extract_dir = std::string(temp_path) + "SLT_manual";
+    LogPush("Временная папка: " + extract_dir);
     std::error_code ec; fs::remove_all(extract_dir, ec);
-    std::string cmd = "powershell -NoProfile -Command \"Expand-Archive -Force -Path '" + zip_path + "' -DestinationPath '" + extract_dir + "'\"";
-    RunHidden(cmd);
+    bool unzip_ok = zipmin::ExtractAll(zip_path, extract_dir);
+    if (!unzip_ok) LogPush("Встроенный распаковщик не смог распаковать ZIP", true);
     int copied = CopyLuaFromDir(extract_dir);
-    LogPush("Установлено файлов из ZIP: " + std::to_string(copied));
+    LogPush("Из ZIP скопировано файлов: " + std::to_string(copied));
+    if (copied == 0) LogPush("В ZIP не найдено ни одного .lua или .manifest!", true);
     fs::remove_all(extract_dir, ec);
     RefreshInstalledFiles(); RefreshInstalledFlags();
-    PushToast("ZIP установлен (" + std::to_string(copied) + " файлов)");
-    AddXP(5, "ZIP");
+    LogPush("Установка ZIP завершена");
 }
 
 static void InstallOpenSteamToolsAsync() {
@@ -1539,9 +1327,10 @@ static void InstallOpenSteamToolsAsync() {
     LogPush("Установка OpenSteamTools...");
 
     std::thread([]() {
+        LogPush("Поиск OpenSteamTools.zip...");
         const char* paths[] = { "OpenSteamTools.zip", "..\\OpenSteamTools.zip" };
         std::string zip;
-        for (auto p : paths) if (fs::exists(p)) { zip = p; break; }
+        for (auto p : paths) if (fs::exists(p)) { zip = p; LogPush("Найден файл: " + std::string(p)); break; }
         g_app.progress_target = 0.10f;
         char temp_path[MAX_PATH]; GetTempPathA(MAX_PATH, temp_path);
         std::string extract_dir = std::string(temp_path) + "OST";
@@ -1554,19 +1343,29 @@ static void InstallOpenSteamToolsAsync() {
             const void* ptr = hData ? LockResource(hData) : nullptr;
             if (!ptr) { LogPush("Не удалось загрузить ресурс", true); g_app.progress_mode.store((int)ProgressMode::None); g_app.progress_target = 0.0f; return; }
             std::ofstream of(zip_path, std::ios::binary); of.write((const char*)ptr, size); of.close();
+            LogPush("OpenSteamTools.zip извлечён из ресурсов в: " + zip_path + " (" + std::to_string(size) + " байт)");
             zip = zip_path;
         }
+        LogPush("Закрытие Steam...");
         g_app.progress_target = 0.20f; CloseSteam();
         g_app.progress_target = 0.45f;
         std::error_code ec; fs::remove_all(extract_dir, ec);
-        std::string cmd = "powershell -NoProfile -Command \"Expand-Archive -Force -Path '" + fs::absolute(zip).string() + "' -DestinationPath '" + extract_dir + "'\"";
-        RunHidden(cmd);
+        bool unzip_ok = zipmin::ExtractAll(fs::absolute(zip).string(), extract_dir);
+        if (!unzip_ok) LogPush("Встроенный распаковщик не смог распаковать OpenSteamTools.zip", true);
         g_app.progress_target = 0.70f;
         int copied = 0;
+        LogPush("Копирование OpenSteamTools в: " + g_app_steam_path);
         for (auto& p : fs::recursive_directory_iterator(extract_dir)) {
             if (!p.is_regular_file()) continue;
-            try { fs::copy_file(p.path(), fs::path(g_app_steam_path) / p.path().filename(), fs::copy_options::overwrite_existing); copied++; }
-            catch (...) {}
+            try {
+                fs::path dst = fs::path(g_app_steam_path) / p.path().filename();
+                fs::copy_file(p.path(), dst, fs::copy_options::overwrite_existing);
+                LogPush("Скопирован: " + p.path().filename().string());
+                copied++;
+            }
+            catch (std::exception& e) {
+                LogPush("Ошибка копирования " + p.path().filename().string() + ": " + e.what(), true);
+            }
         }
         fs::remove_all(extract_dir, ec);
         if (zip == zip_path) fs::remove(zip_path, ec);
@@ -1576,15 +1375,12 @@ static void InstallOpenSteamToolsAsync() {
         g_app.progress_target = 1.0f; std::this_thread::sleep_for(std::chrono::milliseconds(400));
         g_app.progress_mode.store((int)ProgressMode::None); g_app.progress_target = 0.0f; g_app.progress_display = 0.0f;
         ShowSuccess();
-        PushToast("OpenSteamTools установлен");
-        AddXP(15, "OpenSteamTools");
         }).detach();
 }
 
 // ============================================================
-//  FX
+//  FX (все фигуры без скруглений)
 // ============================================================
-
 
 static void DrawAuroraBg(ImDrawList* dl, ImVec2 o, ImVec2 s, float time) {
     ThemeColors t = GetTheme();
@@ -1701,8 +1497,8 @@ static void DrawWeatherFx(ImDrawList* dl, ImVec2 o, ImVec2 s, float dt) {
             if (p.type != 0) continue;
             float px = o.x + p.x * s.x;
             float py = o.y + p.y * s.y;
-            float sway = std::sin(g_fx_time * 1.5f + p.phase) * 6.0f;
-            float alpha = 0.55f + 0.35f * std::sin(g_fx_time * 2.0f + p.phase);
+            float sway = std::sin(g_app.time_accum * 1.5f + p.phase) * 6.0f;
+            float alpha = 0.55f + 0.35f * std::sin(g_app.time_accum * 2.0f + p.phase);
             dl->AddCircleFilled(ImVec2(px + sway, py), p.size, IM_COL32(255, 255, 255, (int)(alpha * 220)), 10);
         }
     }
@@ -1720,7 +1516,7 @@ static void DrawWeatherFx(ImDrawList* dl, ImVec2 o, ImVec2 s, float dt) {
             if (p.type != 2) continue;
             float px = o.x + p.x * s.x;
             float py = o.y + p.y * s.y;
-            float sway = std::sin(g_fx_time * 0.8f + p.phase) * 30.0f;
+            float sway = std::sin(g_app.time_accum * 0.8f + p.phase) * 30.0f;
             px += sway;
             float sz = 4.0f + p.size * 1.5f;
             ImU32 col = IM_COL32(220, 140, 60, 220);
@@ -1733,7 +1529,6 @@ static void DrawWeatherFx(ImDrawList* dl, ImVec2 o, ImVec2 s, float dt) {
     }
 }
 static void DrawBackgroundFx(ImDrawList* dl, ImVec2 o, ImVec2 s, float time) {
-    g_fx_time = time;
     switch (g_fx) {
     case FxMode::Aurora: DrawAuroraBg(dl, o, s, time); break;
     case FxMode::Waves: DrawWavesBg(dl, o, s, time); break;
@@ -1747,12 +1542,12 @@ static void DrawBackgroundFx(ImDrawList* dl, ImVec2 o, ImVec2 s, float time) {
 }
 
 // ============================================================
-//  Кнопки окна
+//  Кнопки окна (без скруглений)
 // ============================================================
 static void DrawWindowButton(ImDrawList* dl, ImVec2 p0, ImVec2 p1, bool is_close, bool hovered, bool active) {
     ImVec4 base = is_close ? ImVec4(0.85f, 0.22f, 0.32f, 1) : ImVec4(1, 1, 1, 1);
-    float bg_alpha = active ? (is_close ? 1.0f : 0.18f) : (hovered ? (is_close ? 0.9f : 0.12f) : 0.0f);
-    dl->AddRectFilled(p0, p1, ColF(base, bg_alpha), 6.0f);
+    float bg_alpha = active ? (is_close ? 1.0f : 0.22f) : (hovered ? (is_close ? 0.9f : 0.14f) : 0.0f);
+    dl->AddRectFilled(p0, p1, ColF(base, bg_alpha), 0.0f);
     ImVec2 c((p0.x + p1.x) * 0.5f, (p0.y + p1.y) * 0.5f);
     ImU32 icon_col = ColF(ImVec4(1, 1, 1, 1), hovered || active ? 1.0f : 0.85f);
     if (is_close) {
@@ -1767,25 +1562,273 @@ static void DrawWindowButton(ImDrawList* dl, ImVec2 p0, ImVec2 p1, bool is_close
 }
 
 // ============================================================
-//  Топбар (6 вкладок)
+//  Иконки вкладок
 // ============================================================
-static void DrawTopBar() {
+static void DrawTabIcon(ImDrawList* dl, int tab_idx, float cx, float cy, bool active, bool hovered, ThemeColors& t) {
+    float R = 14.0f;
+
+    ImVec4 base_col;
+    if (active) {
+        base_col = t.accent;
+    }
+    else if (hovered) {
+        base_col = ImVec4(0.80f, 0.79f, 0.85f, 1.0f);
+    }
+    else {
+        base_col = ImVec4(0.50f, 0.49f, 0.56f, 1.0f);
+    }
+
+    ImVec4 hi_col = ImVec4(
+        MY_CLAMP(base_col.x + 0.20f, 0.0f, 1.0f),
+        MY_CLAMP(base_col.y + 0.20f, 0.0f, 1.0f),
+        MY_CLAMP(base_col.z + 0.20f, 0.0f, 1.0f), 1.0f);
+    ImVec4 lo_col = ImVec4(base_col.x * 0.50f, base_col.y * 0.50f, base_col.z * 0.50f, 1.0f);
+
+    ImU32 c_main = IM_COL32((int)(base_col.x * 255), (int)(base_col.y * 255), (int)(base_col.z * 255), 255);
+    ImU32 c_hi = IM_COL32((int)(hi_col.x * 255), (int)(hi_col.y * 255), (int)(hi_col.z * 255), 255);
+    ImU32 c_lo = IM_COL32((int)(lo_col.x * 255), (int)(lo_col.y * 255), (int)(lo_col.z * 255), 255);
+
+    if (active) {
+        dl->AddCircleFilled(ImVec2(cx, cy), R * 1.75f, ColF(t.accent, 0.10f), 40);
+        dl->AddCircleFilled(ImVec2(cx, cy), R * 1.20f, ColF(t.accent, 0.10f), 40);
+    }
+
+    switch (tab_idx) {
+    case 0: {
+        if (g_icon_small_srv) {
+            float sz = R * 2.4f;
+            ImVec2 p0(cx - sz * 0.5f, cy - sz * 0.5f);
+            ImVec2 p1(cx + sz * 0.5f, cy + sz * 0.5f);
+
+            ImU32 tint;
+            if (active)       tint = ColF(t.accent, 1.0f);
+            else if (hovered) tint = IM_COL32(230, 228, 240, 255);
+            else              tint = IM_COL32(150, 148, 162, 255);
+
+            dl->AddImage((ImTextureID)g_icon_small_srv, p0, p1,
+                ImVec2(0, 0), ImVec2(1, 1), tint);
+        }
+        else {
+            dl->AddCircleFilled(ImVec2(cx, cy), R * 0.98f, c_main, 48);
+        }
+        break;
+    }
+    case 1: {
+        float shelf_y = cy + R * 0.72f;
+
+        struct Book { float x, w, h; };
+        Book books[3] = {
+            { cx - R * 0.72f, R * 0.40f, R * 1.10f },
+            { cx - R * 0.22f, R * 0.44f, R * 1.42f },
+            { cx + R * 0.28f, R * 0.40f, R * 1.22f },
+        };
+
+        for (int i = 0; i < 3; i++) {
+            auto& b = books[i];
+            float by = shelf_y - b.h;
+
+            dl->AddRectFilled(ImVec2(b.x, by), ImVec2(b.x + b.w, shelf_y), c_main);
+
+            dl->AddLine(ImVec2(b.x + 1.5f, by + 1.0f),
+                ImVec2(b.x + b.w - 1.5f, by + 1.0f),
+                c_hi, 1.1f);
+
+            dl->AddLine(ImVec2(b.x + b.w - 1.0f, by + 2.0f),
+                ImVec2(b.x + b.w - 1.0f, shelf_y - 1.0f),
+                c_lo, 0.9f);
+        }
+
+        dl->AddRectFilled(
+            ImVec2(cx - R * 0.95f, shelf_y),
+            ImVec2(cx + R * 0.95f, shelf_y + 2.0f),
+            c_main);
+        dl->AddLine(
+            ImVec2(cx - R * 0.95f, shelf_y + 2.0f),
+            ImVec2(cx + R * 0.95f, shelf_y + 2.0f),
+            c_lo, 1.0f);
+        break;
+    }
+    case 2: {
+        int teeth = 8;
+        float r_in = R * 0.55f;
+        float r_out = R * 0.95f;
+        float half_tooth = 3.1415926f / teeth * 0.42f;
+        for (int i = 0; i < teeth; i++) {
+            float a = i * (2.0f * 3.1415926f / teeth) - 3.1415926f * 0.5f;
+            float a0 = a - half_tooth;
+            float a1 = a + half_tooth;
+            ImVec2 p[4] = {
+                ImVec2(cx + cosf(a0) * r_in,  cy + sinf(a0) * r_in),
+                ImVec2(cx + cosf(a0) * r_out, cy + sinf(a0) * r_out),
+                ImVec2(cx + cosf(a1) * r_out, cy + sinf(a1) * r_out),
+                ImVec2(cx + cosf(a1) * r_in,  cy + sinf(a1) * r_in),
+            };
+            dl->AddConvexPolyFilled(p, 4, c_main);
+        }
+        dl->AddCircleFilled(ImVec2(cx, cy), R * 0.80f, c_main, 40);
+        dl->PathClear();
+        dl->PathArcTo(ImVec2(cx, cy), R * 0.74f, 3.1415926f * 1.15f, 3.1415926f * 1.85f, 24);
+        dl->PathStroke(c_hi, 0, 1.5f);
+        dl->PathClear();
+        dl->PathArcTo(ImVec2(cx, cy), R * 0.74f, 3.1415926f * 0.15f, 3.1415926f * 0.85f, 24);
+        dl->PathStroke(c_lo, 0, 1.2f);
+        dl->AddCircleFilled(ImVec2(cx, cy), R * 0.32f, ColF(t.sidebar_bg, 1.0f), 24);
+        dl->AddCircle(ImVec2(cx, cy), R * 0.32f, c_lo, 24, 1.5f);
+        break;
+    }
+    case 3: {
+        float w = R * 1.85f, h = R * 1.55f;
+        ImVec2 w0(cx - w * 0.5f, cy - h * 0.5f);
+        ImVec2 w1(cx + w * 0.5f, cy + h * 0.5f);
+        dl->AddRectFilled(w0, w1, c_main);
+        dl->AddLine(w0, ImVec2(w1.x, w0.y), c_hi, 1.2f);
+        dl->AddLine(ImVec2(w0.x, w1.y), w1, c_lo, 1.2f);
+
+        float bar_h = R * 0.42f;
+        dl->AddRectFilled(w0, ImVec2(w1.x, w0.y + bar_h), c_lo);
+        dl->AddLine(ImVec2(w0.x, w0.y + bar_h), ImVec2(w1.x, w0.y + bar_h), c_hi, 0.8f);
+
+        float dot_y = w0.y + bar_h * 0.5f;
+        float dot_r = 1.7f;
+        dl->AddCircleFilled(ImVec2(w0.x + 5.5f, dot_y), dot_r, c_hi, 10);
+        dl->AddCircleFilled(ImVec2(w0.x + 10.5f, dot_y), dot_r, c_hi, 10);
+        dl->AddCircleFilled(ImVec2(w0.x + 15.5f, dot_y), dot_r, c_hi, 10);
+
+        float y0 = w1.y - 9.5f;
+        float y1v = w1.y - 6.5f;
+        float y2 = w1.y - 3.5f;
+        dl->AddLine(ImVec2(w0.x + 5.5f, y0), ImVec2(w0.x + 9.0f, y1v), c_hi, 1.7f);
+        dl->AddLine(ImVec2(w0.x + 9.0f, y1v), ImVec2(w0.x + 5.5f, y2), c_hi, 1.7f);
+        dl->AddLine(ImVec2(w0.x + 11.5f, y2), ImVec2(w0.x + 16.0f, y2), c_hi, 1.7f);
+        break;
+    }
+    }
+}
+
+// ============================================================
+//  Sidebar (вертикальные вкладки)
+// ============================================================
+static void DrawSidebar() {
     ThemeColors t = GetTheme();
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, t.topbar_bg);
-    const float topbar_h = 60.0f;
-    ImGui::BeginChild("##topbar", ImVec2(0, topbar_h), false, ImGuiWindowFlags_NoScrollbar);
+    const float sidebar_w = 80.0f;
+
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, t.sidebar_bg);
+    ImGui::BeginChild("##sidebar", ImVec2(sidebar_w, 0), false, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
-    float time = (float)ImGui::GetTime();
 
-    dl->AddRectFilledMultiColor(ImVec2(wp.x, wp.y + ws.y - 1), ImVec2(wp.x + ws.x, wp.y + ws.y),
-        ColF(t.accent, 0.5f), ColF(t.accent3, 0.5f), ColF(t.accent2, 0.5f), ColF(t.accent, 0.5f));
+    dl->AddLine(ImVec2(wp.x + ws.x - 1, wp.y), ImVec2(wp.x + ws.x - 1, wp.y + ws.y),
+        ColF(t.accent, 0.25f), 1.0f);
+
+    const float btn_w = 56.0f, btn_h = 56.0f, btn_gap = 10.0f;
+    const float start_y = 16.0f;
+    const float btn_x = (sidebar_w - btn_w) * 0.5f;
+
+    struct TabInfo { const char* label; int idx; };
+    TabInfo tabs[4] = {
+    {"Магазин",0},{"Библиотека",1},{"Инструменты",2},{"Отладка",3}
+    };
+
+    static float s_under_y = -1.0f;
+    float dt = ImGui::GetIO().DeltaTime; if (dt <= 0.0f) dt = 0.016f;
+    ImVec2 mp = ImGui::GetIO().MousePos;
+
+    bool busy = g_app.IsBusy();
+    float target_under_y = 0.0f;
+    bool got_active = false;
+
+    for (int i = 0; i < 4; i++) {
+        float bx = wp.x + btn_x;
+        float by = wp.y + start_y + i * (btn_h + btn_gap);
+        ImVec2 b0(bx, by), b1(bx + btn_w, by + btn_h);
+
+        bool active = (g_app.current_tab == tabs[i].idx);
+        bool hovered = mp.x >= b0.x && mp.x <= b1.x && mp.y >= b0.y && mp.y <= b1.y && !busy;
+
+        if (active) {
+            target_under_y = by + btn_h * 0.5f;
+            got_active = true;
+        }
+
+        if (active) {
+            dl->AddRectFilled(b0, b1, ColF(t.accent, 0.18f));
+        }
+        else if (hovered) {
+            dl->AddRectFilled(b0, b1, ColF(t.accent, 0.08f));
+        }
+
+        float cx = (b0.x + b1.x) * 0.5f;
+        float cy = (b0.y + b1.y) * 0.5f;
+        DrawTabIcon(dl, tabs[i].idx, cx, cy, active, hovered, t);
+
+        if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            if (g_app.current_tab != tabs[i].idx) {
+                g_app.prev_tab = g_app.current_tab;
+                g_app.current_tab = tabs[i].idx;
+                g_app.tab_fade = 1.0f;
+            }
+        }
+
+        if (hovered) {
+            ImDrawList* fg = ImGui::GetForegroundDrawList();
+            ImVec2 ts = ImGui::CalcTextSize(tabs[i].label);
+            ImVec2 tt0(b1.x + 10, cy - 14.0f);
+            ImVec2 tt1(tt0.x + ts.x + 20, tt0.y + 28.0f);
+            fg->AddRectFilled(tt0, tt1, IM_COL32(25, 22, 34, 245));
+            fg->AddRect(tt0, tt1, ColF(t.accent, 0.7f), 0.0f, 0, 1.0f);
+            fg->AddText(ImVec2(tt0.x + 10, tt0.y + 5), ColF(t.text, 1.0f), tabs[i].label);
+        }
+    }
+
+    if (got_active) {
+        if (s_under_y < 0.0f) s_under_y = target_under_y;
+        s_under_y = ExpLerp(s_under_y, target_under_y, 14.0f, dt);
+
+        float ind_h = 40.0f;
+        float ind_x = wp.x + 4.0f;
+        float ind_w = 3.0f;
+        for (int i = 3; i >= 1; i--) {
+            float e = (float)i * 2.0f;
+            dl->AddRectFilled(ImVec2(ind_x - e * 0.5f, s_under_y - ind_h * 0.5f - e),
+                ImVec2(ind_x + ind_w + e * 0.5f, s_under_y + ind_h * 0.5f + e),
+                ColF(t.accent, 0.10f / i));
+        }
+        dl->AddRectFilled(ImVec2(ind_x, s_under_y - ind_h * 0.5f),
+            ImVec2(ind_x + ind_w, s_under_y + ind_h * 0.5f),
+            ColF(t.accent, 1.0f));
+    }
+
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+}
+
+// ============================================================
+//  Верхняя полоса над контентом
+// ============================================================
+static void DrawMainTopBar() {
+    ThemeColors t = GetTheme();
+    const float topbar_h = 44.0f;
+
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, t.topbar_bg);
+    ImGui::BeginChild("##main_topbar", ImVec2(0, topbar_h), false, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+
+    dl->AddLine(ImVec2(wp.x, wp.y + ws.y - 1), ImVec2(wp.x + ws.x, wp.y + ws.y - 1),
+        ColF(t.accent, 0.25f), 1.0f);
 
     static bool s_drag = false;
     static POINT s_m{}, s_w{};
     ImVec2 mp = ImGui::GetIO().MousePos;
-    bool in_drag = mp.x >= wp.x && mp.x <= wp.x + ws.x - 260 && mp.y >= wp.y && mp.y <= wp.y + 50;
+    bool in_drag = mp.x >= wp.x && mp.x <= wp.x + ws.x - 100 && mp.y >= wp.y && mp.y <= wp.y + topbar_h;
+
+    ImGui::SetCursorPos(ImVec2(20, 12));
+    if (g_font_title) ImGui::PushFont(g_font_title);
+    ImGui::TextColored(t.text, "SteamLuaTools 10.0");
+    if (g_font_title) ImGui::PopFont();
+
     if (!s_drag && in_drag && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
         s_drag = true; GetCursorPos(&s_m); RECT rc; GetWindowRect(g_hwnd, &rc); s_w = { rc.left, rc.top };
     }
@@ -1795,86 +1838,9 @@ static void DrawTopBar() {
     }
     if (ImGui::IsMouseReleased(ImGuiMouseButton_Left)) s_drag = false;
 
-    ImGui::SetCursorPos(ImVec2(28, 18.0f));
-    if (g_font_title) ImGui::PushFont(g_font_title);
-    ImGui::TextColored(t.text, "SteamLuaTools");
-    ImVec2 title_size = ImGui::CalcTextSize("SteamLuaTools");
-    if (g_font_title) ImGui::PopFont();
-
-    {
-        ImVec2 vpos(wp.x + 28 + title_size.x + 20, wp.y + 18 + title_size.y * 0.5f);
-        float vr = 13.0f;
-        float pulse = 0.85f + 0.15f * std::sin(time * 2.5f);
-        dl->AddCircleFilled(vpos, vr * 2.0f, ColF(t.accent, 0.10f * pulse), 48);
-        dl->AddCircleFilled(vpos, vr * 1.5f, ColF(t.accent, 0.18f * pulse), 48);
-        dl->AddCircleFilled(vpos, vr, ColF(t.accent, 0.95f), 48);
-        dl->AddCircle(vpos, vr, ColF(ImVec4(1, 1, 1, 1), 0.6f), 48, 2.0f);
-        const char* ver = "9.5";
-        ImVec2 vsz = ImGui::CalcTextSize(ver);
-        dl->AddText(ImVec2(vpos.x - vsz.x * 0.5f, vpos.y - vsz.y * 0.5f - 1.0f), IM_COL32(255, 255, 255, 255), ver);
-    }
-
-    // Уровень справа от версии
-    {
-        int lvl = LevelFromXP(g_xp);
-        char lvl_buf[64];
-        snprintf(lvl_buf, sizeof(lvl_buf), "Ур. %d · %s", lvl, LevelTitle(lvl));
-        ImVec2 lvl_sz = ImGui::CalcTextSize(lvl_buf);
-        ImVec2 lvl_pos(wp.x + 28 + title_size.x + 50, wp.y + 18 + title_size.y * 0.5f - lvl_sz.y * 0.5f);
-
-        // Плашка
-        dl->AddRectFilled(ImVec2(lvl_pos.x - 8, lvl_pos.y - 4),
-            ImVec2(lvl_pos.x + lvl_sz.x + 8, lvl_pos.y + lvl_sz.y + 4),
-            ColF(t.accent, 0.20f), 6.0f);
-        dl->AddRect(ImVec2(lvl_pos.x - 8, lvl_pos.y - 4),
-            ImVec2(lvl_pos.x + lvl_sz.x + 8, lvl_pos.y + lvl_sz.y + 4),
-            ColF(t.accent, 0.55f), 6.0f, 0, 1.2f);
-        dl->AddText(lvl_pos, ColF(t.text, 1.0f), lvl_buf);
-    }
-
-    // 6 вкладок
-    const float tab_w = 118.0f, tab_h = 32.0f, tab_gap = 5.0f;
-    const float tabs_y = (topbar_h - tab_h) * 0.5f;
-    const float tabs_x = 400.0f;
-    struct TabInfo { const char* label; int idx; };
-    TabInfo tabs[6] = {
-        {"Магазин",0},{"Избранное",1},{"Достижения",2},
-        {"Мини-игры",3},{"Библиотека",4},{"Инструменты",5}
-    };
-    static float s_tab_x[6] = { 0 };
-    float dt = ImGui::GetIO().DeltaTime; if (dt <= 0.0f) dt = 0.016f;
-    bool busy = g_app.IsBusy();
-    if (busy) ImGui::BeginDisabled();
-
-    for (int i = 0; i < 6; i++) {
-        float x = tabs_x + i * (tab_w + tab_gap);
-        s_tab_x[i] = x;
-        ImGui::SetCursorPos(ImVec2(x, tabs_y));
-        ImGui::PushID(i);
-        bool active = (g_app.current_tab == tabs[i].idx);
-        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.0f);
-        ImGui::PushStyleColor(ImGuiCol_Button, active ? ImVec4(t.accent.x, t.accent.y, t.accent.z, 0.20f) : ImVec4(1, 1, 1, 0.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(t.accent.x, t.accent.y, t.accent.z, 0.28f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(t.accent.x, t.accent.y, t.accent.z, 0.38f));
-        ImGui::PushStyleColor(ImGuiCol_Text, active ? t.text : t.text_disabled);
-        if (ImGui::Button(tabs[i].label, ImVec2(tab_w, tab_h))) {
-            if (g_app.current_tab != tabs[i].idx) { g_app.prev_tab = g_app.current_tab; g_app.current_tab = tabs[i].idx; g_app.tab_fade = 0.0f; }
-        }
-        ImGui::PopStyleColor(4); ImGui::PopStyleVar();
-        ImGui::PopID();
-    }
-    if (busy) ImGui::EndDisabled();
-
-    float target_underline_x = s_tab_x[g_app.current_tab];
-    if (!g_app.underline_initialized) { g_app.underline_x = target_underline_x; g_app.underline_initialized = 1; }
-    g_app.underline_x = ExpLerp(g_app.underline_x, target_underline_x, 12.0f, dt);
-    float ux = wp.x + g_app.underline_x + 10, uy = wp.y + tabs_y + tab_h + 2;
-    dl->AddRectFilledMultiColor(ImVec2(ux, uy), ImVec2(ux + tab_w - 20, uy + 3),
-        ColF(t.accent, 1.0f), ColF(t.accent3, 1.0f), ColF(t.accent3, 1.0f), ColF(t.accent, 1.0f));
-
-    const float btn_w = 32.0f, btn_h = 30.0f, gap = 6.0f;
-    float bx1 = wp.x + ws.x - 32.0f - btn_w;
-    float bx0 = bx1 - gap - btn_w;
+    const float btn_w = 40.0f, btn_h = 32.0f;
+    float bx1 = wp.x + ws.x - 8.0f - btn_w;
+    float bx0 = bx1 - btn_w;
     float by = wp.y + (topbar_h - btn_h) * 0.5f;
     ImVec2 min_p0(bx0, by), min_p1(bx0 + btn_w, by + btn_h);
     ImVec2 cls_p0(bx1, by), cls_p1(bx1 + btn_w, by + btn_h);
@@ -1888,12 +1854,6 @@ static void DrawTopBar() {
     ImGui::EndChild();
     ImGui::PopStyleColor();
 }
-
-// ============================================================
-//  Forward
-// ============================================================
-static void RebuildFiltered();
-static bool IsFavorite(const std::string& appid);
 
 // ============================================================
 //  ComboBox тегов
@@ -1945,8 +1905,8 @@ static void DrawTagComboBox(float width, float height) {
 
     ImU32 bg_col = ColF(t.accent, hovered ? 0.14f : 0.06f);
     ImU32 bd_col = ColF(t.accent, hovered || s_open ? 0.9f : 0.45f);
-    dl->AddRectFilled(p0, p1, bg_col, 8.0f);
-    dl->AddRect(p0, p1, bd_col, 8.0f, 0, 1.5f);
+    dl->AddRectFilled(p0, p1, bg_col, 0.0f);
+    dl->AddRect(p0, p1, bd_col, 0.0f, 0, 1.5f);
     {
         ImVec2 ic(p0.x + 16.0f, p0.y + height * 0.5f);
         ImU32 ic_col = ColF(t.accent, 0.95f);
@@ -1972,12 +1932,12 @@ static void DrawTagComboBox(float width, float height) {
         for (int i = 6; i >= 1; --i) {
             float e = (float)i * 1.4f;
             fg->AddRect(ImVec2(lp0.x - e, lp0.y - e), ImVec2(lp1.x + e, lp1.y + e),
-                ColF(ImVec4(0, 0, 0, 1), 0.06f * a), 12.0f, 0, 1.0f);
+                ColF(ImVec4(0, 0, 0, 1), 0.06f * a), 0.0f, 0, 1.0f);
         }
         ImU32 popup_bg = ColF(ImVec4(t.window_bg.x + 0.02f, t.window_bg.y + 0.02f, t.window_bg.z + 0.04f, 1.0f), 1.0f);
         ImU32 popup_bd = ColF(t.accent, 0.65f * a);
-        fg->AddRectFilled(lp0, lp1, popup_bg, 10.0f);
-        fg->AddRect(lp0, lp1, popup_bd, 10.0f, 0, 1.5f);
+        fg->AddRectFilled(lp0, lp1, popup_bg);
+        fg->AddRect(lp0, lp1, popup_bd, 0.0f, 0, 1.5f);
 
         float inner_x0 = lp0.x + 6.0f, inner_x1 = lp1.x - 6.0f, inner_y0 = lp0.y + pad_y;
         if (scroll) {
@@ -2001,11 +1961,11 @@ static void DrawTagComboBox(float width, float height) {
             bool item_hover = ImGui::IsMouseHoveringRect(r0, r1) && ImGui::IsMouseHoveringRect(lp0, lp1);
             bool selected = (i == g_app.selected_tag);
             if (selected) {
-                fg->AddRectFilled(r0, r1, ColF(t.accent, (item_hover ? 0.45f : 0.30f) * a), 7.0f);
-                fg->AddRectFilled(ImVec2(r0.x + 2, r0.y + 5), ImVec2(r0.x + 5, r1.y - 5), ColF(t.accent, 1.0f * a), 2.0f);
+                fg->AddRectFilled(r0, r1, ColF(t.accent, (item_hover ? 0.45f : 0.30f) * a));
+                fg->AddRectFilled(ImVec2(r0.x + 2, r0.y + 5), ImVec2(r0.x + 5, r1.y - 5), ColF(t.accent, 1.0f * a));
             }
             else if (item_hover) {
-                fg->AddRectFilled(r0, r1, ColF(t.accent, 0.20f * a), 7.0f);
+                fg->AddRectFilled(r0, r1, ColF(t.accent, 0.20f * a));
             }
             ImVec2 ts = ImGui::CalcTextSize(g_app.available_tags[i].c_str());
             ImVec2 tp(r0.x + 14.0f, r0.y + (row_h - ts.y) * 0.5f);
@@ -2029,7 +1989,7 @@ static void DrawTagComboBox(float width, float height) {
             float bar_h = list_h * (list_h / full_h);
             float bar_y = lp0.y + (s_scroll / max_scroll) * (list_h - bar_h);
             fg->AddRectFilled(ImVec2(lp1.x - 5.0f, bar_y), ImVec2(lp1.x - 2.0f, bar_y + bar_h),
-                ColF(t.accent, 0.65f * a), 2.0f);
+                ColF(t.accent, 0.65f * a));
         }
         fg->PopClipRect();
     }
@@ -2037,38 +1997,10 @@ static void DrawTagComboBox(float width, float height) {
 }
 
 // ============================================================
-//  Избранное — хелперы
-// ============================================================
-static bool IsFavorite(const std::string& appid) {
-    for (auto& g : g_app.all_games) if (g.appid == appid) return g.favorite;
-    return false;
-}
-static void ToggleFavorite(const std::string& appid) {
-    for (auto& g : g_app.all_games) {
-        if (g.appid == appid) {
-            g.favorite = !g.favorite;
-            if (g.favorite) {
-                g_stat_fav++; SaveSettings();
-                PushToast("Добавлено в избранное");
-                AddXP(1, "избранное");
-                if (g_stat_fav >= 1) UnlockAchievement("fav_first");
-                if (g_stat_fav >= 10) UnlockAchievement("fav_ten");
-                if (g_stat_fav >= 50) UnlockAchievement("fav_fifty");
-            }
-            else {
-                PushToast("Удалено из избранного");
-            }
-            break;
-        }
-    }
-    SaveSettings();
-}
-
-// ============================================================
-//  Карточка
+//  Карточка (без скруглений)
 // ============================================================
 static void DrawGameCard(int gi, ImVec2 p0, ImVec2 p1, bool blocked,
-    bool& out_star, bool& out_copy)
+    bool& out_copy, bool& out_hovered)
 {
     ThemeColors t = GetTheme();
     ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -2083,20 +2015,30 @@ static void DrawGameCard(int gi, ImVec2 p0, ImVec2 p1, bool blocked,
         g_app.outline_pos_target = p0;
         g_app.outline_size_target = ImVec2(cw, ch);
     }
-    g.star_hover_t = ExpLerp(g.star_hover_t, hovered ? 1.0f : 0.0f, 10.0f, dt);
-    g.copy_hover_t = g.star_hover_t;
+    out_hovered = hovered;
+    g.copy_hover_t = ExpLerp(g.copy_hover_t, hovered ? 1.0f : 0.0f, 10.0f, dt);
 
-    dl->AddRectFilled(p0, p1, ColF(hovered ? t.card_bg_hover : t.card_bg, 1.0f), 10.0f);
+    ImVec2 mp_now = ImGui::GetIO().MousePos;
+    const char* lbl_steam = "Steam";
+    ImVec2 ts_steam = ImGui::CalcTextSize(lbl_steam);
+    float pad_x_s = 14.0f, pad_y_s = 7.0f;
+    float bw_s = ts_steam.x + pad_x_s * 2, bh_s = ts_steam.y + pad_y_s * 2;
+    ImVec2 sp1_s(p1.x - 10.0f, p1.y - 10.0f);
+    ImVec2 sp0_s(sp1_s.x - bw_s, sp1_s.y - bh_s);
+    bool over_steam = hovered && mp_now.x >= sp0_s.x && mp_now.x <= sp1_s.x && mp_now.y >= sp0_s.y && mp_now.y <= sp1_s.y;
+    g.steam_hover_t = ExpLerp(g.steam_hover_t, (hovered || over_steam) ? 1.0f : 0.0f, 10.0f, dt);
+
+    dl->AddRectFilled(p0, p1, ColF(hovered ? t.card_bg_hover : t.card_bg, 1.0f), 0.0f);
     if (g.texture) {
         if (g.open_time > 0.0f) {
             float t2 = MY_CLAMP(((float)ImGui::GetTime() - g.open_time) * 4.0f, 0.0f, 1.0f);
             g.fade_in = EaseOutCubic(t2);
         }
-        dl->AddImageRounded((ImTextureID)g.texture, p0, p1, ImVec2(0, 0), ImVec2(1, 1),
-            ColF(ImVec4(1, 1, 1, 1), g.fade_in), 10.0f);
+        dl->AddImage((ImTextureID)g.texture, p0, p1, ImVec2(0, 0), ImVec2(1, 1),
+            ColF(ImVec4(1, 1, 1, 1), g.fade_in));
     }
     else {
-        dl->AddRectFilled(p0, p1, IM_COL32(50, 48, 62, 255), 10.0f);
+        dl->AddRectFilled(p0, p1, IM_COL32(50, 48, 62, 255), 0.0f);
         const char* ni = "Нет изображения";
         ImVec2 sz = ImGui::CalcTextSize(ni);
         dl->AddText(ImVec2(p0.x + (cw - sz.x) * 0.5f, p0.y + (ch - sz.y) * 0.5f), IM_COL32(180, 175, 200, 255), ni);
@@ -2109,7 +2051,7 @@ static void DrawGameCard(int gi, ImVec2 p0, ImVec2 p1, bool blocked,
         float bw = ts.x + px * 2, bh = ts.y + py * 2;
         ImVec2 bp0(p0.x + 8, p0.y + 8);
         ImVec2 bp1(bp0.x + bw, bp0.y + bh);
-        dl->AddRectFilled(bp0, bp1, IM_COL32(80, 200, 120, 255), bh * 0.5f);
+        dl->AddRectFilled(bp0, bp1, IM_COL32(80, 200, 120, 255), 0.0f);
         dl->AddText(ImVec2(bp0.x + px, bp0.y + py), IM_COL32(0, 0, 0, 255), lbl);
     }
     if (g.nsfw) {
@@ -2119,60 +2061,48 @@ static void DrawGameCard(int gi, ImVec2 p0, ImVec2 p1, bool blocked,
         float bw = ts.x + px * 2, bh = ts.y + py * 2;
         ImVec2 bp0(p1.x - bw - 14, p0.y + 14);
         ImVec2 bp1(bp0.x + bw, bp0.y + bh);
-        dl->AddRectFilled(bp0, bp1, IM_COL32(200, 60, 80, 200), bh * 0.5f);
+        dl->AddRectFilled(bp0, bp1, IM_COL32(200, 60, 80, 200), 0.0f);
         dl->AddText(ImVec2(bp0.x + px, bp0.y + py), IM_COL32(255, 255, 255, 230), lbl);
     }
 
     ImVec2 mp = ImGui::GetIO().MousePos;
-    const float icon_sz = 34.0f;
-    float star_x = p0.x + 8.0f, star_y = p1.y - icon_sz - 8.0f;
-    float copy_x = p0.x + 8.0f, copy_y = p0.y + 8.0f;
-    ImVec2 star0(star_x, star_y), star1(star_x + icon_sz, star_y + icon_sz);
-    ImVec2 copy0(copy_x, copy_y), copy1(copy_x + icon_sz, copy_y + icon_sz);
 
-    out_star = false;
+    const char* copy_lbl = "Copy ID";
+    ImVec2 copy_ts = ImGui::CalcTextSize(copy_lbl);
+    const float cp_pad_x = 10.0f;
+    const float cp_pad_y = 6.0f;
+    float cp_w = copy_ts.x + cp_pad_x * 2.0f;
+    float cp_h = copy_ts.y + cp_pad_y * 2.0f;
+    ImVec2 copy0(p0.x + 8.0f, p0.y + 8.0f);
+    ImVec2 copy1(copy0.x + cp_w, copy0.y + cp_h);
+
     out_copy = false;
 
-    if (g.star_hover_t > 0.01f) {
-        float a = g.star_hover_t;
-        bool sh = hovered && mp.x >= star0.x && mp.x <= star1.x && mp.y >= star0.y && mp.y <= star1.y;
+    if (g.copy_hover_t > 0.01f) {
+        float a = g.copy_hover_t;
         bool ch = hovered && mp.x >= copy0.x && mp.x <= copy1.x && mp.y >= copy0.y && mp.y <= copy1.y;
 
         if (ch && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) out_copy = true;
-        else if (sh && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) out_star = true;
 
-        ImVec2 so(0, (1.0f - a) * 8.0f), co(0, -(1.0f - a) * 8.0f);
+        ImVec2 co(0, -(1.0f - a) * 8.0f);
+        ImVec2 c0(copy0.x + co.x, copy0.y + co.y);
+        ImVec2 c1(copy1.x + co.x, copy1.y + co.y);
 
-        {
-            ImVec2 c0(copy0.x + co.x, copy0.y + co.y), c1(copy1.x + co.x, copy1.y + co.y);
-            dl->AddRectFilled(c0, c1, ColF(t.window_bg, 0.75f * a), 8.0f);
-            dl->AddRect(c0, c1, ColF(t.accent, (ch ? 1.0f : 0.6f) * a), 8.0f, 0, 1.5f);
-            ImU32 ic = ColF(t.text, a);
-            dl->AddRect(ImVec2(c0.x + 10, c0.y + 8), ImVec2(c0.x + 22, c0.y + 20), ic, 2.0f, 0, 1.4f);
-            dl->AddRect(ImVec2(c0.x + 8, c0.y + 12), ImVec2(c0.x + 20, c0.y + 24), ic, 2.0f, 0, 1.4f);
-        }
-        {
-            ImVec2 s0(star0.x + so.x, star0.y + so.y), s1(star1.x + so.x, star1.y + so.y);
-            dl->AddRectFilled(s0, s1, ColF(t.window_bg, 0.75f * a), 8.0f);
-            dl->AddRect(s0, s1, ColF(t.accent, (sh ? 1.0f : 0.6f) * a), 8.0f, 0, 1.5f);
-            ImVec2 c((s0.x + s1.x) * 0.5f, (s0.y + s1.y) * 0.5f);
-            float R = 9.5f, r = R * 0.45f;
-            ImU32 col = g.favorite ? IM_COL32(255, 210, 60, (int)(255 * a)) : IM_COL32(240, 240, 245, (int)(230 * a));
-            ImU32 edge = g.favorite ? IM_COL32(255, 170, 30, (int)(255 * a)) : ColF(t.text, 0.85f * a);
-            ImVec2 pts[10];
-            for (int i = 0; i < 10; i++) {
-                float ang = -1.5707963f + i * 3.1415926f / 5.0f;
-                float rr = (i % 2 == 0) ? R : r;
-                pts[i] = ImVec2(c.x + std::cos(ang) * rr, c.y + std::sin(ang) * rr);
-            }
-            dl->AddConvexPolyFilled(pts, 10, col);
-            for (int i = 0; i < 10; i++) dl->AddLine(pts[i], pts[(i + 1) % 10], edge, 1.2f);
-        }
+        ImU32 bg = ch ? ColF(t.accent, 0.90f * a)
+            : ColF(t.window_bg, 0.82f * a);
+        dl->AddRectFilled(c0, c1, bg);
+
+        ImU32 bd = ch ? IM_COL32(255, 255, 255, (int)(255 * a))
+            : ColF(t.accent, 0.85f * a);
+        dl->AddRect(c0, c1, bd, 0.0f, 0, 1.5f);
+
+        ImU32 txt = ch ? IM_COL32(255, 255, 255, (int)(255 * a))
+            : ColF(t.text, a);
+        dl->AddText(ImVec2(c0.x + cp_pad_x, c0.y + cp_pad_y), txt, copy_lbl);
     }
 
-    bool over_star = hovered && mp.x >= star0.x && mp.x <= star1.x && mp.y >= star0.y && mp.y <= star1.y;
     bool over_copy = hovered && mp.x >= copy0.x && mp.x <= copy1.x && mp.y >= copy0.y && mp.y <= copy1.y;
-    bool show_tt = hovered && !blocked && !over_star && !over_copy;
+    bool show_tt = hovered && !blocked && !over_copy;
     if (show_tt) {
         ImDrawList* fg = ImGui::GetForegroundDrawList();
         ImVec2 ns = ImGui::CalcTextSize(g.name.c_str());
@@ -2182,7 +2112,6 @@ static void DrawGameCard(int gi, ImVec2 p0, ImVec2 p1, bool blocked,
         if (g.tags.empty()) tl += "—";
         else for (size_t i = 0; i < g.tags.size(); ++i) { if (i) tl += ", "; tl += g.tags[i]; }
         if (g.nsfw) tl += "  [NSFW]";
-        if (g.favorite) tl += "  [Избранное]";
         ImVec2 tls = ImGui::CalcTextSize(tl.c_str());
         float px = 12.0f, py = 10.0f;
         float bw = std::max({ ns.x, ids.x, tls.x }) + px * 2;
@@ -2192,8 +2121,8 @@ static void DrawGameCard(int gi, ImVec2 p0, ImVec2 p1, bool blocked,
         if (b1.x > scr.x - 10) b0.x = mp.x - bw - 16;
         if (b1.y > scr.y - 10) b0.y = mp.y - bh - 16;
         b1 = ImVec2(b0.x + bw, b0.y + bh);
-        fg->AddRectFilled(b0, b1, IM_COL32(45, 45, 55, 250), 8.0f);
-        fg->AddRect(b0, b1, ColF(t.accent, 0.7f), 8.0f, 0, 1.2f);
+        fg->AddRectFilled(b0, b1, IM_COL32(45, 45, 55, 250));
+        fg->AddRect(b0, b1, ColF(t.accent, 0.7f), 0.0f, 0, 1.2f);
         fg->AddText(ImVec2(b0.x + px, b0.y + py), IM_COL32(255, 255, 255, 255), g.name.c_str());
         fg->AddText(ImVec2(b0.x + px, b0.y + py + ns.y + 4.0f), ColF(t.accent, 1.0f), idb);
         fg->AddText(ImVec2(b0.x + px, b0.y + py + ns.y + ids.y + 8.0f),
@@ -2208,6 +2137,9 @@ static void DrawShopPage() {
     ThemeColors t = GetTheme();
     ImDrawList* dl = ImGui::GetWindowDrawList();
     float dt = ImGui::GetIO().DeltaTime; if (dt <= 0.0f) dt = 0.016f;
+
+    bool input_blocked = IsInputBlocked();
+    if (input_blocked) ImGui::BeginDisabled();
 
     ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 24.0f);
     const float combo_w = 240.0f, combo_h = 38.0f;
@@ -2229,8 +2161,8 @@ static void DrawShopPage() {
 
     ImGui::Spacing(); ImGui::Spacing();
 
-    if (g_app.all_games.empty()) { ImGui::Dummy(ImVec2(0, 40)); ImGui::TextColored(t.text_disabled, "Загрузка базы игр..."); return; }
-    if (g_app.filtered.empty()) { ImGui::Dummy(ImVec2(0, 40)); ImGui::TextColored(t.text_disabled, "По выбранному фильтру ничего не найдено."); return; }
+    if (g_app.all_games.empty()) { ImGui::Dummy(ImVec2(0, 40)); ImGui::TextColored(t.text_disabled, "Загрузка базы игр..."); if (input_blocked) ImGui::EndDisabled(); return; }
+    if (g_app.filtered.empty()) { ImGui::Dummy(ImVec2(0, 40)); ImGui::TextColored(t.text_disabled, "По выбранному фильтру ничего не найдено."); if (input_blocked) ImGui::EndDisabled(); return; }
 
     ImVec2 avail_region = ImGui::GetContentRegionAvail();
     float pager_h = 70.0f;
@@ -2253,8 +2185,9 @@ static void DrawShopPage() {
         GameEntry& g = g_app.all_games[gi];
         ImVec2 p0 = grid_origin;
         ImVec2 p1 = ImVec2(p0.x + card_w, p0.y + card_h);
-        bool s_c = false, c_c = false;
-        DrawGameCard(gi, p0, p1, block, s_c, c_c);
+        bool c_c = false;
+        bool card_hovered = false;
+        DrawGameCard(gi, p0, p1, block, c_c, card_hovered);
 
         ImGui::SetCursorScreenPos(p0);
         ImGui::PushID(gi);
@@ -2263,7 +2196,9 @@ static void DrawShopPage() {
         ImGui::PopID();
 
         bool st_c = false;
-        if (!block) {
+        if (!block && g_app.all_games[gi].steam_hover_t > 0.01f) {
+            float steam_a = g_app.all_games[gi].steam_hover_t;
+
             ImVec2 mp = ImGui::GetIO().MousePos;
             const char* lbl = "Steam";
             ImVec2 ts = ImGui::CalcTextSize(lbl);
@@ -2272,17 +2207,21 @@ static void DrawShopPage() {
             ImVec2 sp1(p1.x - 10.0f, p1.y - 10.0f);
             ImVec2 sp0(sp1.x - bw, sp1.y - bh);
             bool sh = mp.x >= sp0.x && mp.x <= sp1.x && mp.y >= sp0.y && mp.y <= sp1.y;
-            ImU32 bg = sh ? IM_COL32(30, 130, 220, 255) : IM_COL32(20, 90, 160, 235);
-            ImU32 bd = sh ? IM_COL32(120, 200, 255, 255) : IM_COL32(80, 160, 230, 200);
-            dl->AddRectFilled(sp0, sp1, bg, 8.0f);
-            dl->AddRect(sp0, sp1, bd, 8.0f, 0, 1.5f);
-            dl->AddText(ImVec2(sp0.x + pad_x, sp0.y + pad_y), IM_COL32(255, 255, 255, 255), lbl);
+
+            ImU32 bg = sh ? IM_COL32(30, 130, 220, (int)(255 * steam_a))
+                : IM_COL32(20, 90, 160, (int)(235 * steam_a));
+            ImU32 bd = sh ? IM_COL32(120, 200, 255, (int)(255 * steam_a))
+                : IM_COL32(80, 160, 230, (int)(200 * steam_a));
+
+            dl->AddRectFilled(sp0, sp1, bg);
+            dl->AddRect(sp0, sp1, bd, 0.0f, 0, 1.5f);
+            dl->AddText(ImVec2(sp0.x + pad_x, sp0.y + pad_y), IM_COL32(255, 255, 255, (int)(255 * steam_a)), lbl);
+
             if (sh && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) st_c = true;
         }
 
-        if (s_c) ToggleFavorite(g.appid);
-        else if (st_c) OpenGameInSteam(g.appid);
-        else if (c_c) { CopyToClipboard(g.appid); g_stat_copy++; SaveSettings(); PushToast("AppID скопирован"); AddXP(1, "копирование"); UnlockAchievement("copy_id"); }
+        if (st_c) OpenGameInSteam(g.appid);
+        else if (c_c) { CopyToClipboard(g.appid); LogPush("AppID скопирован: " + g.appid); }
         else if (card_clicked && !busy && !block) DownloadManifestAsync(g.appid, g.name);
     }
     else {
@@ -2299,8 +2238,9 @@ static void DrawShopPage() {
             ImVec2 p0(grid_origin.x + col * (card_w + gap), grid_origin.y + row * (card_h + gap));
             ImVec2 p1(p0.x + card_w, p0.y + card_h);
 
-            bool s_c = false, c_c = false;
-            DrawGameCard(gi, p0, p1, block, s_c, c_c);
+            bool c_c = false;
+            bool card_hovered = false;
+            DrawGameCard(gi, p0, p1, block, c_c, card_hovered);
 
             ImGui::PushID(gi);
             ImGui::SetCursorScreenPos(p0);
@@ -2309,7 +2249,9 @@ static void DrawShopPage() {
             ImGui::PopID();
 
             bool st_c = false;
-            if (!block) {
+            if (!block && g_app.all_games[gi].steam_hover_t > 0.01f) {
+                float steam_a = g_app.all_games[gi].steam_hover_t;
+
                 ImVec2 mp = ImGui::GetIO().MousePos;
                 const char* lbl = "Steam";
                 ImVec2 ts = ImGui::CalcTextSize(lbl);
@@ -2318,23 +2260,23 @@ static void DrawShopPage() {
                 ImVec2 sp1(p1.x - 10.0f, p1.y - 10.0f);
                 ImVec2 sp0(sp1.x - bw, sp1.y - bh);
                 bool sh = mp.x >= sp0.x && mp.x <= sp1.x && mp.y >= sp0.y && mp.y <= sp1.y;
-                ImU32 bg = sh ? IM_COL32(30, 130, 220, 255) : IM_COL32(20, 90, 160, 235);
-                ImU32 bd = sh ? IM_COL32(120, 200, 255, 255) : IM_COL32(80, 160, 230, 200);
-                dl->AddRectFilled(sp0, sp1, bg, 8.0f);
-                dl->AddRect(sp0, sp1, bd, 8.0f, 0, 1.5f);
-                dl->AddText(ImVec2(sp0.x + pad_x, sp0.y + pad_y), IM_COL32(255, 255, 255, 255), lbl);
+
+                ImU32 bg = sh ? IM_COL32(30, 130, 220, (int)(255 * steam_a))
+                    : IM_COL32(20, 90, 160, (int)(235 * steam_a));
+                ImU32 bd = sh ? IM_COL32(120, 200, 255, (int)(255 * steam_a))
+                    : IM_COL32(80, 160, 230, (int)(200 * steam_a));
+
+                dl->AddRectFilled(sp0, sp1, bg);
+                dl->AddRect(sp0, sp1, bd, 0.0f, 0, 1.5f);
+                dl->AddText(ImVec2(sp0.x + pad_x, sp0.y + pad_y), IM_COL32(255, 255, 255, (int)(255 * steam_a)), lbl);
+
                 if (sh && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) st_c = true;
             }
 
-            if (s_c) ToggleFavorite(g_app.all_games[gi].appid);
-            else if (st_c) OpenGameInSteam(g_app.all_games[gi].appid);
+            if (st_c) OpenGameInSteam(g_app.all_games[gi].appid);
             else if (c_c) {
                 CopyToClipboard(g_app.all_games[gi].appid);
-                g_stat_copy++; SaveSettings();
-                PushToast("AppID скопирован");
-                AddXP(1, "копирование");
-                UnlockAchievement("copy_id");
-                if (g_stat_copy >= 100) UnlockAchievement("copy_hundred");
+                LogPush("AppID скопирован: " + g_app.all_games[gi].appid);
             }
             else if (card_clicked && !busy && !block)
                 DownloadManifestAsync(g_app.all_games[gi].appid, g_app.all_games[gi].name);
@@ -2349,13 +2291,12 @@ static void DrawShopPage() {
             for (int i = 6; i >= 1; i--) {
                 float e = (float)i * 1.6f;
                 dl->AddRect(ImVec2(o0.x - e, o0.y - e), ImVec2(o1.x + e, o1.y + e),
-                    ColF(t.accent, g_app.outline_alpha * (0.06f / i)), 12.0f + e, 0, 2.0f);
+                    ColF(t.accent, g_app.outline_alpha * (0.06f / i)), 0.0f, 0, 2.0f);
             }
-            dl->AddRect(o0, o1, ColF(t.accent, g_app.outline_alpha), 12.0f, 0, 2.5f);
+            dl->AddRect(o0, o1, ColF(t.accent, g_app.outline_alpha), 0.0f, 0, 2.5f);
         }
     }
 
-    // Пагинация
     int total_pages = std::max(1, (int)((g_app.filtered.size() + AppState::kGamesPerPage - 1) / AppState::kGamesPerPage));
     float pager_y = grid_origin.y + grid_h + 6.0f;
     float pager_c = pager_y + pager_h * 0.5f;
@@ -2373,7 +2314,6 @@ static void DrawShopPage() {
     ImVec2 pg_sz = ImGui::CalcTextSize(pg_buf);
     pdl->AddText(ImVec2(grid_origin.x, pager_c - pg_sz.y * 0.5f), IM_COL32(140, 138, 155, 255), pg_buf);
 
-    // Случайная игра
     {
         const char* lbl = "Случайная игра";
         ImVec2 ts = ImGui::CalcTextSize(lbl);
@@ -2383,19 +2323,14 @@ static void DrawShopPage() {
         ImVec2 b0(bx, byy), b1(bx + bw, byy + bh);
         bool hv = mp.x >= b0.x && mp.x <= b1.x && mp.y >= b0.y && mp.y <= b1.y;
         ImU32 bg = hv ? ColF(t.accent, 0.35f) : ColF(t.accent, 0.15f);
-        pdl->AddRectFilled(b0, b1, bg, 10.0f);
-        pdl->AddRect(b0, b1, ColF(t.accent, hv ? 1.0f : 0.5f), 10.0f, 0, 1.5f);
+        pdl->AddRectFilled(b0, b1, bg);
+        pdl->AddRect(b0, b1, ColF(t.accent, hv ? 1.0f : 0.5f), 0.0f, 0, 1.5f);
         pdl->AddText(ImVec2(b0.x + 20, b0.y + (bh - ts.y) * 0.5f), ColF(t.text, 1.0f), lbl);
         if (hv && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !busy && !block && !g_app.filtered.empty()) {
             std::mt19937 rng((unsigned)std::chrono::system_clock::now().time_since_epoch().count());
             std::uniform_int_distribution<int> dist(0, (int)g_app.filtered.size() - 1);
             g_app.random_index = g_app.filtered[dist(rng)];
             g_app.random_mode = true;
-            g_stat_random++; SaveSettings();
-            PushToast("Случайная игра выбрана");
-            AddXP(1, "рандом");
-            UnlockAchievement("random_use");
-            if (g_stat_random >= 10) UnlockAchievement("random_ten");
         }
     }
 
@@ -2422,10 +2357,10 @@ static void DrawShopPage() {
                 if (is_cur) {
                     for (int i = 5; i >= 1; i--) {
                         float e = i * 1.4f;
-                        pdl->AddRect(ImVec2(s0.x - e, s0.y - e), ImVec2(s1.x + e, s1.y + e), ColF(t.accent, 0.10f / i), 12.0f, 0, 1.5f);
+                        pdl->AddRect(ImVec2(s0.x - e, s0.y - e), ImVec2(s1.x + e, s1.y + e), ColF(t.accent, 0.10f / i), 0.0f, 0, 1.5f);
                     }
-                    pdl->AddRectFilled(s0, s1, IM_COL32(255, 255, 255, 15), 10.0f);
-                    pdl->AddRect(s0, s1, ColF(t.accent, 1.0f), 10.0f, 0, 2.5f);
+                    pdl->AddRectFilled(s0, s1, IM_COL32(255, 255, 255, 15));
+                    pdl->AddRect(s0, s1, ColF(t.accent, 1.0f), 0.0f, 0, 2.5f);
                     snprintf(b, sizeof(b), "%d", pn);
                     ImVec2 ts = ImGui::CalcTextSize(b);
                     pdl->AddText(ImVec2(s0.x + (sq - ts.x) * 0.5f, s0.y + (sq - ts.y) * 0.5f), ColF(t.text, 1.0f), b);
@@ -2434,7 +2369,7 @@ static void DrawShopPage() {
                     snprintf(b, sizeof(b), "%d", pn);
                     ImVec2 ts = ImGui::CalcTextSize(b);
                     ImU32 bd = hv ? ColF(t.accent, 0.8f) : IM_COL32(180, 180, 190, 200);
-                    pdl->AddRect(s0, s1, bd, 10.0f, 0, 1.8f);
+                    pdl->AddRect(s0, s1, bd, 0.0f, 0, 1.8f);
                     pdl->AddText(ImVec2(s0.x + (sq - ts.x) * 0.5f, s0.y + (sq - ts.y) * 0.5f),
                         hv ? ColF(t.accent, 1.0f) : IM_COL32(200, 200, 210, 220), b);
                     if (hv && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) { g_app.prev_page = g_app.page; g_app.page = pn - 1; g_app.page_switch_t = 0.0f; }
@@ -2465,7 +2400,7 @@ static void DrawShopPage() {
             bool err = (g_app.goto_error_timer > 0.0f);
             if (err) { ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(1, 0.25f, 0.30f, 1)); ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 2.5f); }
             else { ImGui::PushStyleColor(ImGuiCol_Border, ColF(t.accent, 0.8f)); ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.5f); }
-            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 21.0f);
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 0.0f);
             ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(255, 255, 255, 8));
             ImGui::SetNextItemWidth(inp_w);
             if (ImGui::InputTextWithHint("##goto", "К странице...", g_app.goto_buf, IM_ARRAYSIZE(g_app.goto_buf),
@@ -2491,894 +2426,13 @@ static void DrawShopPage() {
         ImVec2 b0(bx, byy), b1(bx + bw, byy + bh);
         bool hv = mp.x >= b0.x && mp.x <= b1.x && mp.y >= b0.y && mp.y <= b1.y;
         ImU32 bg = hv ? ColF(t.accent2, 0.35f) : ColF(t.accent2, 0.15f);
-        pdl->AddRectFilled(b0, b1, bg, 8.0f);
-        pdl->AddRect(b0, b1, ColF(t.accent2, hv ? 1.0f : 0.5f), 8.0f, 0, 1.5f);
+        pdl->AddRectFilled(b0, b1, bg);
+        pdl->AddRect(b0, b1, ColF(t.accent2, hv ? 1.0f : 0.5f), 0.0f, 0, 1.5f);
         pdl->AddText(ImVec2(b0.x + 15, b0.y + (bh - ts.y) * 0.5f), ColF(t.text, 1.0f), lbl);
         if (hv && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) { g_app.random_mode = false; g_app.random_index = -1; }
     }
-}
 
-// ============================================================
-//  ИЗБРАННОЕ
-// ============================================================
-static void DrawFavoritesPage() {
-    ThemeColors t = GetTheme();
-    bool busy = g_app.IsBusy();
-    bool block = g_tag_combo_open || g_tag_combo_just_picked;
-
-    std::vector<int> favs;
-    for (int i = 0; i < (int)g_app.all_games.size(); ++i)
-        if (g_app.all_games[i].favorite) favs.push_back(i);
-
-    ImGui::Dummy(ImVec2(0, 4));
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 24.0f);
-    ImGui::TextDisabled("Избранных игр: %d", (int)favs.size());
-    ImGui::Spacing();
-
-    if (favs.empty()) {
-        ImGui::Dummy(ImVec2(0, 40));
-        ImGui::TextColored(t.text_disabled, "В избранном пока пусто. Нажмите звезду на карточке игры.");
-        return;
-    }
-
-    ImVec2 avail = ImGui::GetContentRegionAvail();
-    float pager_h = 70.0f;
-    float grid_h = avail.y - pager_h;
-    float side_pad = 24.0f;
-    avail.x -= side_pad * 2.0f;
-    float gap = 14.0f;
-    float card_w = (avail.x - gap * (AppState::kGridCols - 1)) / AppState::kGridCols;
-    float card_h = (grid_h - gap * (AppState::kGridRows - 1)) / AppState::kGridRows;
-
-    ImVec2 grid_origin = ImGui::GetCursorScreenPos();
-    grid_origin.x += side_pad;
-
-    int total_pages = std::max(1, (int)((favs.size() + AppState::kGamesPerPage - 1) / AppState::kGamesPerPage));
-    if (g_app.fav_page >= total_pages) g_app.fav_page = total_pages - 1;
-    if (g_app.fav_page < 0) g_app.fav_page = 0;
-
-    int start = g_app.fav_page * AppState::kGamesPerPage;
-    int end = std::min((int)favs.size(), start + AppState::kGamesPerPage);
-
-    g_app.outline_any_hover = false;
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-
-    for (int idx = start; idx < end; ++idx) {
-        int gi = favs[idx];
-        int local = idx - start, col = local % AppState::kGridCols, row = local / AppState::kGridCols;
-        ImVec2 p0(grid_origin.x + col * (card_w + gap), grid_origin.y + row * (card_h + gap));
-        ImVec2 p1(p0.x + card_w, p0.y + card_h);
-
-        bool s_c = false, c_c = false;
-        DrawGameCard(gi, p0, p1, block, s_c, c_c);
-
-        ImGui::PushID(gi);
-        ImGui::SetCursorScreenPos(p0);
-        ImGui::InvisibleButton("card_fav", ImVec2(card_w, card_h));
-        bool cc = ImGui::IsItemClicked();
-        ImGui::PopID();
-
-        bool st_c = false;
-        if (!block) {
-            ImVec2 mp = ImGui::GetIO().MousePos;
-            const char* lbl = "Steam";
-            ImVec2 ts = ImGui::CalcTextSize(lbl);
-            float pad_x = 14.0f, pad_y = 7.0f;
-            float bw = ts.x + pad_x * 2, bh = ts.y + pad_y * 2;
-            ImVec2 sp1(p1.x - 10.0f, p1.y - 10.0f);
-            ImVec2 sp0(sp1.x - bw, sp1.y - bh);
-            bool sh = mp.x >= sp0.x && mp.x <= sp1.x && mp.y >= sp0.y && mp.y <= sp1.y;
-            ImU32 bg = sh ? IM_COL32(30, 130, 220, 255) : IM_COL32(20, 90, 160, 235);
-            ImU32 bd = sh ? IM_COL32(120, 200, 255, 255) : IM_COL32(80, 160, 230, 200);
-            dl->AddRectFilled(sp0, sp1, bg, 8.0f);
-            dl->AddRect(sp0, sp1, bd, 8.0f, 0, 1.5f);
-            dl->AddText(ImVec2(sp0.x + pad_x, sp0.y + pad_y), IM_COL32(255, 255, 255, 255), lbl);
-            if (sh && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) st_c = true;
-        }
-
-        if (s_c) ToggleFavorite(g_app.all_games[gi].appid);
-        else if (st_c) OpenGameInSteam(g_app.all_games[gi].appid);
-        else if (c_c) { CopyToClipboard(g_app.all_games[gi].appid); g_stat_copy++; SaveSettings(); PushToast("AppID скопирован"); AddXP(1, "копирование"); UnlockAchievement("copy_id"); }
-        else if (cc && !busy && !block) DownloadManifestAsync(g_app.all_games[gi].appid, g_app.all_games[gi].name);
-    }
-
-    float pager_y = grid_origin.y + grid_h + 6.0f;
-    float pager_c = pager_y + pager_h * 0.5f;
-    ImDrawList* pdl = ImGui::GetWindowDrawList();
-    ImVec2 mp = ImGui::GetIO().MousePos;
-    const float sq_mid = 50.0f, sq_side = 42.0f, sq_gap = 14.0f, arrow_w = 30.0f, arrow_h = 32.0f, arrow_gap = 22.0f;
-    float group_center = grid_origin.x + avail.x * 0.5f;
-    float mid_x = group_center - sq_mid * 0.5f;
-
-    {
-        float c_x = mid_x - sq_gap - sq_side - arrow_gap - arrow_w * 0.5f;
-        ImVec2 a0(c_x - arrow_w * 0.5f, pager_c - arrow_h * 0.5f), a1(c_x + arrow_w * 0.5f, pager_c + arrow_h * 0.5f);
-        bool en = (g_app.fav_page > 0) && !busy && !block;
-        bool hv = en && mp.x >= a0.x && mp.x <= a1.x && mp.y >= a0.y && mp.y <= a1.y;
-        ImU32 col = !en ? IM_COL32(120, 120, 130, 90) : hv ? ColF(t.accent, 1.0f) : IM_COL32(230, 230, 240, 230);
-        pdl->AddTriangleFilled(ImVec2(c_x - arrow_w * 0.35f, pager_c), ImVec2(c_x + arrow_w * 0.35f, pager_c - 11), ImVec2(c_x + arrow_w * 0.35f, pager_c + 11), col);
-        pdl->AddRectFilled(ImVec2(c_x - 2, pager_c - 3), ImVec2(c_x + arrow_w * 0.35f, pager_c + 3), col);
-        if (hv && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) g_app.fav_page--;
-    }
-    {
-        int lp = g_app.fav_page - 1, rp = g_app.fav_page + 1;
-        auto draw_sq = [&](int pn, float x, bool is_cur) {
-            float sq = is_cur ? sq_mid : sq_side;
-            ImVec2 s0(x, pager_y + (pager_h - sq) * 0.5f), s1(s0.x + sq, s0.y + sq);
-            bool hv = mp.x >= s0.x && mp.x <= s1.x && mp.y >= s0.y && mp.y <= s1.y;
-            if (!is_cur) hv = hv && !busy && !block;
-            char b[16];
-            if (is_cur) {
-                for (int i = 5; i >= 1; i--) {
-                    float e = i * 1.4f;
-                    pdl->AddRect(ImVec2(s0.x - e, s0.y - e), ImVec2(s1.x + e, s1.y + e), ColF(t.accent, 0.10f / i), 12.0f, 0, 1.5f);
-                }
-                pdl->AddRectFilled(s0, s1, IM_COL32(255, 255, 255, 15), 10.0f);
-                pdl->AddRect(s0, s1, ColF(t.accent, 1.0f), 10.0f, 0, 2.5f);
-                snprintf(b, sizeof(b), "%d", pn);
-                ImVec2 ts = ImGui::CalcTextSize(b);
-                pdl->AddText(ImVec2(s0.x + (sq - ts.x) * 0.5f, s0.y + (sq - ts.y) * 0.5f), ColF(t.text, 1.0f), b);
-            }
-            else {
-                snprintf(b, sizeof(b), "%d", pn);
-                ImVec2 ts = ImGui::CalcTextSize(b);
-                ImU32 bd = hv ? ColF(t.accent, 0.8f) : IM_COL32(180, 180, 190, 200);
-                pdl->AddRect(s0, s1, bd, 10.0f, 0, 1.8f);
-                pdl->AddText(ImVec2(s0.x + (sq - ts.x) * 0.5f, s0.y + (sq - ts.y) * 0.5f),
-                    hv ? ColF(t.accent, 1.0f) : IM_COL32(200, 200, 210, 220), b);
-                if (hv && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) g_app.fav_page = pn - 1;
-            }
-            };
-        if (lp >= 0) draw_sq(lp + 1, mid_x - sq_gap - sq_side, false);
-        draw_sq(g_app.fav_page + 1, mid_x, true);
-        if (rp < total_pages) draw_sq(rp + 1, mid_x + sq_mid + sq_gap, false);
-    }
-    {
-        int rp = g_app.fav_page + 1;
-        float re = (rp >= total_pages) ? (mid_x + sq_mid) : (mid_x + sq_mid + sq_gap + sq_side);
-        float c_x = re + arrow_gap + arrow_w * 0.5f;
-        ImVec2 a0(c_x - arrow_w * 0.5f, pager_c - arrow_h * 0.5f), a1(c_x + arrow_w * 0.5f, pager_c + arrow_h * 0.5f);
-        bool en = (g_app.fav_page < total_pages - 1) && !busy && !block;
-        bool hv = en && mp.x >= a0.x && mp.x <= a1.x && mp.y >= a0.y && mp.y <= a1.y;
-        ImU32 col = !en ? IM_COL32(120, 120, 130, 90) : hv ? ColF(t.accent, 1.0f) : IM_COL32(230, 230, 240, 230);
-        pdl->AddTriangleFilled(ImVec2(c_x + arrow_w * 0.35f, pager_c), ImVec2(c_x - arrow_w * 0.35f, pager_c - 11), ImVec2(c_x - arrow_w * 0.35f, pager_c + 11), col);
-        pdl->AddRectFilled(ImVec2(c_x - arrow_w * 0.35f, pager_c - 3), ImVec2(c_x + 2, pager_c + 3), col);
-        if (hv && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) g_app.fav_page++;
-    }
-
-    char b[64]; snprintf(b, sizeof(b), "Страниц: %d", total_pages);
-    pdl->AddText(ImVec2(grid_origin.x, pager_c - 8.0f), IM_COL32(140, 138, 155, 255), b);
-}
-
-// ============================================================
-//  ДОСТИЖЕНИЯ
-// ============================================================
-static void DrawAchievementsPage() {
-    ThemeColors t = GetTheme();
-    ImGui::Dummy(ImVec2(0, 4));
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 24.0f);
-    ImGui::Spacing();
-
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-    ImGui::BeginChild("##ach_scroll", ImVec2(0, 0), false, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-    ImGui::PopStyleVar();
-
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    ImVec2 wp = ImGui::GetWindowPos();
-    ImVec2 ws = ImGui::GetWindowSize();
-
-    float row_h = 52.0f, gap = 8.0f;
-    float pad_x = 24.0f;
-    float list_top = wp.y + 8.0f;
-    float list_bottom = wp.y + ws.y - 8.0f;
-    float list_h = list_bottom - list_top;
-    float row_w = ws.x - pad_x * 2.0f - 22.0f;
-
-    float content_h = g_achievements.size() * (row_h + gap);
-    static float s_scroll = 0.0f;
-    float max_scroll = std::max(0.0f, content_h - list_h);
-    ImVec2 mp = ImGui::GetIO().MousePos;
-    bool over = mp.x >= wp.x && mp.x <= wp.x + ws.x && mp.y >= list_top && mp.y <= list_bottom;
-    if (over && ImGui::GetIO().MouseWheel != 0.0f) {
-        s_scroll -= ImGui::GetIO().MouseWheel * 60.0f;
-        if (s_scroll < 0.0f) s_scroll = 0.0f;
-        if (s_scroll > max_scroll) s_scroll = max_scroll;
-    }
-
-    int first = (int)(s_scroll / (row_h + gap));
-    int visible = (int)(list_h / (row_h + gap)) + 2;
-    int last = std::min((int)g_achievements.size(), first + visible);
-    float y_off = s_scroll - first * (row_h + gap);
-
-    // Редкости
-    auto rarityColor = [&](int r) -> ImU32 {
-        switch (r) {
-        case 0: return IM_COL32(160, 160, 180, 255);
-        case 1: return IM_COL32(80, 180, 255, 255);
-        case 2: return IM_COL32(180, 100, 255, 255);
-        case 3: return IM_COL32(255, 180, 60, 255);
-        default: return IM_COL32(160, 160, 180, 255);
-        }
-        };
-    auto rarityName = [](int r) -> const char* {
-    switch (r) { case 0: return "Обычное"; case 1: return "Редкое"; case 2: return "Эпическое"; case 3: return "Легендарное"; default: return ""; }
-        };
-
-    for (int i = first; i < last; ++i) {
-        auto& a = g_achievements[i];
-        float y = list_top + (i - first) * (row_h + gap) - y_off;
-        if (y + row_h < list_top || y > list_bottom) continue;
-        ImVec2 p0(wp.x + pad_x, y);
-        ImVec2 p1(wp.x + pad_x + row_w, y + row_h);
-
-        ImU32 rc = rarityColor(a.rarity);
-        ImU32 bg = a.done ? (a.rarity == 3 ? IM_COL32(255, 180, 60, 30) : ColF(t.accent, 0.12f)) : IM_COL32(255, 255, 255, 10);
-        dl->AddRectFilled(p0, p1, bg, 10.0f);
-        dl->AddRect(p0, p1, a.done ? rc : IM_COL32(120, 120, 130, 140), 10.0f, 0, a.rarity >= 2 && a.done ? 2.0f : 1.5f);
-
-        float sq = 28.0f;
-        ImVec2 s0(p1.x - sq - 14, p0.y + (row_h - sq) * 0.5f);
-        ImVec2 s1(s0.x + sq, s0.y + sq);
-        if (a.done) {
-            dl->AddRectFilled(s0, s1, IM_COL32(60, 190, 100, 255), 6.0f);
-            ImVec2 c((s0.x + s1.x) * 0.5f, (s0.y + s1.y) * 0.5f);
-            dl->AddLine(ImVec2(c.x - 8, c.y), ImVec2(c.x - 2, c.y + 6), IM_COL32(255, 255, 255, 255), 2.6f);
-            dl->AddLine(ImVec2(c.x - 2, c.y + 6), ImVec2(c.x + 9, c.y - 7), IM_COL32(255, 255, 255, 255), 2.6f);
-        }
-        else {
-            dl->AddRectFilled(s0, s1, IM_COL32(80, 80, 90, 180), 6.0f);
-            dl->AddRect(s0, s1, IM_COL32(140, 140, 150, 200), 6.0f, 0, 1.5f);
-        }
-
-        // Скрытое до получения
-        std::string title = a.title;
-        std::string desc = a.desc;
-        if (a.secret && !a.done) { title = "??? — Секрет"; desc = "Секретное достижение"; }
-
-        dl->AddText(ImVec2(p0.x + 18, p0.y + 8), a.done ? rc : ColF(t.text, 1.0f), title.c_str());
-        dl->AddText(ImVec2(p0.x + 18, p0.y + 28), ColF(t.text_disabled, 1.0f), desc.c_str());
-
-        // Редкость слева
-        dl->AddText(ImVec2(p0.x - 22, p0.y + 6), rc, "");
-        // Редкость в правом верхнем
-        ImVec2 rn_sz = ImGui::CalcTextSize(rarityName(a.rarity));
-        dl->AddText(ImVec2(p1.x - rn_sz.x - 50, p0.y + 8), rc, rarityName(a.rarity));
-    }
-
-    if (max_scroll > 0.0f) {
-        float track_x = wp.x + ws.x - 14.0f;
-        float track_w = 6.0f;
-        float bar_h = std::max(40.0f, list_h * (list_h / content_h));
-        float bar_y = list_top + (s_scroll / max_scroll) * (list_h - bar_h);
-        dl->AddRectFilled(ImVec2(track_x, list_top), ImVec2(track_x + track_w, list_bottom),
-            IM_COL32(255, 255, 255, 15), 3.0f);
-        dl->AddRectFilled(ImVec2(track_x, bar_y), ImVec2(track_x + track_w, bar_y + bar_h),
-            ColF(t.accent, 0.7f), 3.0f);
-    }
-
-    ImGui::EndChild();
-}
-
-// ============================================================
-//  МИНИ-ИГРЫ (UI)
-// ============================================================
-static void DrawStarsInline(ImDrawList* dl, ImVec2 pos, int stars, float size) {
-    for (int i = 0; i < 5; i++) {
-        ImVec2 c(pos.x + i * (size + 3), pos.y);
-        float R = size * 0.5f, r = R * 0.45f;
-        ImU32 col = (i < stars) ? IM_COL32(255, 210, 60, 255) : IM_COL32(100, 100, 110, 180);
-        ImVec2 pts[10];
-        for (int k = 0; k < 10; k++) {
-            float ang = -1.5707963f + k * 3.1415926f / 5.0f;
-            float rr = (k % 2 == 0) ? R : r;
-            pts[k] = ImVec2(c.x + std::cos(ang) * rr, c.y + std::sin(ang) * rr);
-        }
-        dl->AddConvexPolyFilled(pts, 10, col);
-    }
-}
-
-static void DrawMiniGameReaction(ImVec2 p0, ImVec2 p1) {
-    ThemeColors t = GetTheme();
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    ImVec2 mp = ImGui::GetIO().MousePos;
-    float dt = ImGui::GetIO().DeltaTime;
-
-    ImVec2 c((p0.x + p1.x) * 0.5f, (p0.y + p1.y) * 0.5f);
-
-    if (g_mini.running) {
-        if (!g_mini.react_ready) {
-            // Ждём
-            g_mini.timer += dt;
-            dl->AddRectFilled(p0, p1, IM_COL32(60, 40, 80, 200), 10.0f);
-            const char* txt = "Ждите...";
-            ImVec2 ts = ImGui::CalcTextSize(txt);
-            dl->AddText(ImVec2(c.x - ts.x * 0.5f, c.y - ts.y * 0.5f), ColF(t.text, 1.0f), txt);
-            if (g_mini.timer > 1.5f + (rand() % 2000) / 1000.0f) {
-                g_mini.react_ready = true;
-                g_mini.react_start = (float)ImGui::GetTime();
-            }
-        }
-        else {
-            // Зелёный — жми
-            float pulse = 0.5f + 0.5f * std::sin((float)ImGui::GetTime() * 6.0f);
-            dl->AddRectFilled(p0, p1, IM_COL32(60 + (int)(pulse * 60), 180, 80, 220), 10.0f);
-            const char* txt = "ЖМИ!";
-            ImVec2 ts = ImGui::CalcTextSize(txt);
-            dl->AddText(ImVec2(c.x - ts.x * 0.5f, c.y - ts.y * 0.5f), IM_COL32(255, 255, 255, 255), txt);
-
-            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-                float elapsed = ((float)ImGui::GetTime() - g_mini.react_start) * 1000.0f;
-                g_mini.score = (int)elapsed;
-                MiniFinish();
-            }
-            if (g_mini.timer > 5.0f) { g_mini.score = 9999; MiniFinish(); }
-        }
-    }
-    else if (g_mini.finished) {
-        dl->AddRectFilled(p0, p1, IM_COL32(40, 30, 50, 220), 10.0f);
-        ImVec2 ts = ImGui::CalcTextSize(g_mini.message.c_str());
-        dl->AddText(ImVec2(c.x - ts.x * 0.5f, c.y - ts.y * 0.5f), ColF(t.text, 1.0f), g_mini.message.c_str());
-    }
-}
-
-static void DrawMiniGameMemory(ImVec2 p0, ImVec2 p1) {
-    ThemeColors t = GetTheme();
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    ImVec2 mp = ImGui::GetIO().MousePos;
-    float dt = ImGui::GetIO().DeltaTime;
-
-    if (!g_mini.running) {
-        if (g_mini.finished) {
-            ImVec2 c((p0.x + p1.x) * 0.5f, (p0.y + p1.y) * 0.5f);
-            ImVec2 ts = ImGui::CalcTextSize(g_mini.message.c_str());
-            dl->AddText(ImVec2(c.x - ts.x * 0.5f, c.y - ts.y * 0.5f), ColF(t.text, 1.0f), g_mini.message.c_str());
-        }
-        return;
-    }
-
-    int total = (int)g_mini.mem_cards.size();
-    int cols = 5;
-    int rows = (total + cols - 1) / cols;
-    float cw = (p1.x - p0.x - 20.0f) / cols - 8.0f;
-    float chh = (p1.y - p0.y - 20.0f) / rows - 8.0f;
-    cw = std::min(cw, chh);
-
-    if (g_mini.mem_flash_t > 0.0f) {
-        g_mini.mem_flash_t -= dt;
-        if (g_mini.mem_flash_t <= 0.0f) {
-            g_mini.mem_flipped[g_mini.mem_flip_a] = false;
-            g_mini.mem_flipped[g_mini.mem_flip_b] = false;
-            g_mini.mem_flip_a = -1;
-            g_mini.mem_flip_b = -1;
-        }
-    }
-
-    for (int i = 0; i < total; i++) {
-        int r = i / cols, c = i % cols;
-        ImVec2 pp0(p0.x + 10 + c * (cw + 8), p0.y + 10 + r * (chh + 8));
-        ImVec2 pp1(pp0.x + cw, pp0.y + cw);
-
-        bool hover = mp.x >= pp0.x && mp.x <= pp1.x && mp.y >= pp0.y && mp.y <= pp1.y;
-        bool show = g_mini.mem_flipped[i] || g_mini.mem_done[i];
-
-        ImU32 bg = show ? IM_COL32(80 + g_mini.mem_cards[i] * 15, 120, 200 - g_mini.mem_cards[i] * 12, 255) : IM_COL32(60, 55, 80, 255);
-        if (hover && !show) bg = IM_COL32(80, 75, 110, 255);
-
-        dl->AddRectFilled(pp0, pp1, bg, 8.0f);
-        dl->AddRect(pp0, pp1, ColF(t.accent, hover && !show ? 1.0f : 0.4f), 8.0f, 0, 1.5f);
-
-        if (show) {
-            char b[8]; snprintf(b, sizeof(b), "%d", g_mini.mem_cards[i]);
-            ImVec2 ts = ImGui::CalcTextSize(b);
-            dl->AddText(ImVec2(pp0.x + (cw - ts.x) * 0.5f, pp0.y + (cw - ts.y) * 0.5f), IM_COL32(255, 255, 255, 255), b);
-        }
-
-        if (hover && !show && g_mini.mem_flash_t <= 0.0f && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-            if (g_mini.mem_flip_a < 0) {
-                g_mini.mem_flip_a = i;
-                g_mini.mem_flipped[i] = true;
-            }
-            else if (g_mini.mem_flip_b < 0 && i != g_mini.mem_flip_a) {
-                g_mini.mem_flip_b = i;
-                g_mini.mem_flipped[i] = true;
-                if (g_mini.mem_cards[g_mini.mem_flip_a] == g_mini.mem_cards[g_mini.mem_flip_b]) {
-                    g_mini.mem_done[g_mini.mem_flip_a] = true;
-                    g_mini.mem_done[g_mini.mem_flip_b] = true;
-                    g_mini.score += 2;
-                    g_mini.mem_flip_a = -1;
-                    g_mini.mem_flip_b = -1;
-                }
-                else {
-                    g_mini.mem_flash_t = 0.8f;
-                }
-            }
-            // Проверка победы
-            bool all = true;
-            for (bool d : g_mini.mem_done) if (!d) { all = false; break; }
-            if (all) MiniFinish();
-        }
-    }
-}
-
-static void DrawMiniGameClicker(ImVec2 p0, ImVec2 p1) {
-    ThemeColors t = GetTheme();
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    float dt = ImGui::GetIO().DeltaTime;
-
-    if (!g_mini.running) {
-        if (g_mini.finished) {
-            ImVec2 c((p0.x + p1.x) * 0.5f, (p0.y + p1.y) * 0.5f);
-            ImVec2 ts = ImGui::CalcTextSize(g_mini.message.c_str());
-            dl->AddText(ImVec2(c.x - ts.x * 0.5f, c.y - ts.y * 0.5f), ColF(t.text, 1.0f), g_mini.message.c_str());
-        }
-        return;
-    }
-
-    g_mini.timer += dt;
-    if (g_mini.timer >= g_mini.time_limit) { g_mini.score = g_mini.clicks; MiniFinish(); return; }
-
-    ImVec2 c((p0.x + p1.x) * 0.5f, (p0.y + p1.y) * 0.5f);
-    float pulse = 0.95f + 0.05f * std::sin((float)ImGui::GetTime() * 12.0f);
-    float radius = 80.0f * pulse;
-
-    dl->AddCircleFilled(c, radius + 8, IM_COL32(60, 40, 80, 200), 32);
-    dl->AddCircleFilled(c, radius, ColF(t.accent, 0.9f), 32);
-    dl->AddCircle(c, radius, ColF(t.text, 0.6f), 32, 2.0f);
-
-    char b[32]; snprintf(b, sizeof(b), "%d", g_mini.clicks);
-    ImVec2 ts = ImGui::CalcTextSize(b);
-    dl->AddText(ImVec2(c.x - ts.x * 0.5f, c.y - ts.y * 0.5f), IM_COL32(255, 255, 255, 255), b);
-
-    // Таймер
-    float remain = g_mini.time_limit - g_mini.timer;
-    char tb[32]; snprintf(tb, sizeof(tb), "%.1f сек", remain);
-    ImVec2 tts = ImGui::CalcTextSize(tb);
-    dl->AddText(ImVec2(c.x - tts.x * 0.5f, p0.y + 10), ColF(t.text, 1.0f), tb);
-
-    ImVec2 mp = ImGui::GetIO().MousePos;
-    float dx = mp.x - c.x, dy = mp.y - c.y;
-    if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && dx * dx + dy * dy <= radius * radius) {
-        g_mini.clicks++;
-        g_mini.score = g_mini.clicks;
-    }
-}
-
-static void DrawMiniGameMath(ImVec2 p0, ImVec2 p1) {
-    ThemeColors t = GetTheme();
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    float dt = ImGui::GetIO().DeltaTime;
-
-    if (!g_mini.running) {
-        if (g_mini.finished) {
-            ImVec2 c((p0.x + p1.x) * 0.5f, (p0.y + p1.y) * 0.5f);
-            ImVec2 ts = ImGui::CalcTextSize(g_mini.message.c_str());
-            dl->AddText(ImVec2(c.x - ts.x * 0.5f, c.y - ts.y * 0.5f), ColF(t.text, 1.0f), g_mini.message.c_str());
-        }
-        return;
-    }
-
-    g_mini.timer += dt;
-    if (g_mini.timer >= g_mini.time_limit) { MiniFinish(); return; }
-
-    ImVec2 c((p0.x + p1.x) * 0.5f, (p0.y + p1.y) * 0.5f);
-    char b[64]; snprintf(b, sizeof(b), "%d + %d = ?", g_mini.math_a, g_mini.math_b);
-    ImVec2 ts = ImGui::CalcTextSize(b);
-    dl->AddText(ImVec2(c.x - ts.x * 0.5f, c.y - 80), ColF(t.text, 1.0f), b);
-
-    char sb[64]; snprintf(sb, sizeof(sb), "Решено: %d   ·   %.1f сек", g_mini.score, g_mini.time_limit - g_mini.timer);
-    ImVec2 ss = ImGui::CalcTextSize(sb);
-    dl->AddText(ImVec2(c.x - ss.x * 0.5f, p0.y + 10), ColF(t.text_disabled, 1.0f), sb);
-
-    // Поле ввода — используем ImGui-виджет по фиксированной позиции
-    ImGui::SetCursorScreenPos(ImVec2(c.x - 100, c.y));
-    ImGui::PushID("math_input");
-    ImGui::SetNextItemWidth(200);
-    ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(255, 255, 255, 15));
-    if (ImGui::InputText("##mi", g_mini.math_input, IM_ARRAYSIZE(g_mini.math_input), ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_CharsDecimal)) {
-        int val = atoi(g_mini.math_input);
-        if (val == g_mini.math_answer) {
-            g_mini.score++;
-            g_mini.math_streak++;
-            std::mt19937 rng((unsigned)std::chrono::system_clock::now().time_since_epoch().count());
-            std::uniform_int_distribution<int> d(1, 20);
-            g_mini.math_a = d(rng);
-            g_mini.math_b = d(rng);
-            g_mini.math_answer = g_mini.math_a + g_mini.math_b;
-            g_mini.math_input[0] = 0;
-        }
-        else {
-            g_mini.math_streak = 0;
-            g_mini.math_input[0] = 0;
-        }
-    }
-    ImGui::PopStyleColor();
-    ImGui::PopID();
-
-    ImGui::SetCursorScreenPos(ImVec2(p0.x, p1.y + 8));
-    ImGui::Dummy(ImVec2(1, 1));
-}
-
-static void DrawMiniGameSnake(ImVec2 p0, ImVec2 p1) {
-    ThemeColors t = GetTheme();
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    float dt = ImGui::GetIO().DeltaTime;
-
-    if (!g_mini.running) {
-        if (g_mini.finished) {
-            ImVec2 c((p0.x + p1.x) * 0.5f, (p0.y + p1.y) * 0.5f);
-            ImVec2 ts = ImGui::CalcTextSize(g_mini.message.c_str());
-            dl->AddText(ImVec2(c.x - ts.x * 0.5f, c.y - ts.y * 0.5f), ColF(t.text, 1.0f), g_mini.message.c_str());
-        }
-        return;
-    }
-
-    int grid = g_mini.snake_grid;
-    float side = std::min(p1.x - p0.x, p1.y - p0.y) - 20.0f;
-    float cell = side / grid;
-    ImVec2 origin((p0.x + p1.x) * 0.5f - side * 0.5f, (p0.y + p1.y) * 0.5f - side * 0.5f);
-
-    dl->AddRectFilled(origin, ImVec2(origin.x + side, origin.y + side), IM_COL32(20, 20, 30, 220), 6.0f);
-
-    g_mini.snake_move_t += dt;
-    float step = 0.14f;
-    if (g_mini.snake_move_t >= step) {
-        g_mini.snake_move_t -= step;
-
-        // Управление
-        ImGuiIO& io = ImGui::GetIO();
-        if ((ImGui::IsKeyPressed(ImGuiKey_W) || ImGui::IsKeyPressed(ImGuiKey_UpArrow)) && g_mini.snake_dir.y == 0) g_mini.snake_dir = ImVec2(0, -1);
-        else if ((ImGui::IsKeyPressed(ImGuiKey_S) || ImGui::IsKeyPressed(ImGuiKey_DownArrow)) && g_mini.snake_dir.y == 0) g_mini.snake_dir = ImVec2(0, 1);
-        else if ((ImGui::IsKeyPressed(ImGuiKey_A) || ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) && g_mini.snake_dir.x == 0) g_mini.snake_dir = ImVec2(-1, 0);
-        else if ((ImGui::IsKeyPressed(ImGuiKey_D) || ImGui::IsKeyPressed(ImGuiKey_RightArrow)) && g_mini.snake_dir.x == 0) g_mini.snake_dir = ImVec2(1, 0);
-
-        ImVec2 head = g_mini.snake[0];
-        ImVec2 nh(head.x + g_mini.snake_dir.x, head.y + g_mini.snake_dir.y);
-        if (nh.x < 0 || nh.x >= grid || nh.y < 0 || nh.y >= grid) { MiniFinish(); return; }
-
-        // Проверка на столкновение с телом
-        for (auto& seg : g_mini.snake) {
-            if (seg.x == nh.x && seg.y == nh.y) { MiniFinish(); return; }
-        }
-
-        g_mini.snake.insert(g_mini.snake.begin(), nh);
-
-        // Яблоко
-        bool ate = false;
-        for (size_t i = 0; i < g_mini.apples.size(); i++) {
-            if (g_mini.apples[i].x == nh.x && g_mini.apples[i].y == nh.y) {
-                g_mini.apples.erase(g_mini.apples.begin() + i);
-                g_mini.score++;
-                ate = true;
-                break;
-            }
-        }
-        if (!ate) g_mini.snake.pop_back();
-
-        if (g_mini.apples.empty()) {
-            std::mt19937 rng((unsigned)std::chrono::system_clock::now().time_since_epoch().count());
-            std::uniform_int_distribution<int> d(0, grid - 1);
-            g_mini.apples.push_back(ImVec2((float)d(rng), (float)d(rng)));
-        }
-    }
-
-    for (auto& seg : g_mini.snake) {
-        ImVec2 s0(origin.x + seg.x * cell + 1, origin.y + seg.y * cell + 1);
-        ImVec2 s1(s0.x + cell - 2, s0.y + cell - 2);
-        dl->AddRectFilled(s0, s1, ColF(t.accent, 0.9f), 3.0f);
-    }
-    for (auto& ap : g_mini.apples) {
-        ImVec2 c(origin.x + ap.x * cell + cell * 0.5f, origin.y + ap.y * cell + cell * 0.5f);
-        dl->AddCircleFilled(c, cell * 0.4f, IM_COL32(220, 60, 60, 255), 12);
-    }
-
-    char b[64]; snprintf(b, sizeof(b), "Яблок: %d", g_mini.score);
-    dl->AddText(ImVec2(origin.x, origin.y - 22), ColF(t.text, 1.0f), b);
-}
-
-static void DrawMiniGameColor(ImVec2 p0, ImVec2 p1) {
-    ThemeColors t = GetTheme();
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    float dt = ImGui::GetIO().DeltaTime;
-
-    if (!g_mini.running) {
-        if (g_mini.finished) {
-            ImVec2 c((p0.x + p1.x) * 0.5f, (p0.y + p1.y) * 0.5f);
-            ImVec2 ts = ImGui::CalcTextSize(g_mini.message.c_str());
-            dl->AddText(ImVec2(c.x - ts.x * 0.5f, c.y - ts.y * 0.5f), ColF(t.text, 1.0f), g_mini.message.c_str());
-        }
-        return;
-    }
-
-    g_mini.timer += dt;
-    if (g_mini.timer >= g_mini.time_limit) { MiniFinish(); return; }
-
-    ImVec2 c((p0.x + p1.x) * 0.5f, (p0.y + p1.y) * 0.5f);
-
-    // Целевой цвет
-    ImVec2 t0(c.x - 250, c.y - 60);
-    ImVec2 t1(c.x - 30, c.y + 60);
-    dl->AddRectFilled(t0, t1, IM_COL32((int)(g_mini.col_target_r * 255), (int)(g_mini.col_target_g * 255), (int)(g_mini.col_target_b * 255), 255), 8.0f);
-    dl->AddRect(t0, t1, ColF(t.text, 0.5f), 8.0f, 0, 2.0f);
-
-    // Предположение
-    ImVec2 g0(c.x + 30, c.y - 60);
-    ImVec2 g1(c.x + 250, c.y + 60);
-    dl->AddRectFilled(g0, g1, IM_COL32((int)(g_mini.col_guess_r * 255), (int)(g_mini.col_guess_g * 255), (int)(g_mini.col_guess_b * 255), 255), 8.0f);
-    dl->AddRect(g0, g1, ColF(t.text, 0.5f), 8.0f, 0, 2.0f);
-
-    // Слайдеры RGB
-    ImGui::SetCursorScreenPos(ImVec2(c.x - 250, c.y + 90));
-    ImGui::PushID("color_sliders");
-    ImGui::PushItemWidth(500);
-    ImGui::SliderFloat("##r", &g_mini.col_guess_r, 0.0f, 1.0f, "R %.2f");
-    ImGui::SliderFloat("##g", &g_mini.col_guess_g, 0.0f, 1.0f, "G %.2f");
-    ImGui::SliderFloat("##b", &g_mini.col_guess_b, 0.0f, 1.0f, "B %.2f");
-    ImGui::PopItemWidth();
-
-    if (ImGui::Button("Проверить", ImVec2(500, 30))) {
-        float dr = g_mini.col_target_r - g_mini.col_guess_r;
-        float dg = g_mini.col_target_g - g_mini.col_guess_g;
-        float db = g_mini.col_target_b - g_mini.col_guess_b;
-        float dist = std::sqrt(dr * dr + dg * dg + db * db);
-        if (dist < 0.15f) {
-            g_mini.score++;
-            std::mt19937 rng((unsigned)std::chrono::system_clock::now().time_since_epoch().count());
-            std::uniform_real_distribution<float> d(0.1f, 0.9f);
-            g_mini.col_target_r = d(rng); g_mini.col_target_g = d(rng); g_mini.col_target_b = d(rng);
-        }
-        else {
-            g_mini.col_streak = 0;
-        }
-    }
-    ImGui::PopID();
-
-    char b[64]; snprintf(b, sizeof(b), "Угадано: %d   ·   %.1f", g_mini.score, g_mini.time_limit - g_mini.timer);
-    dl->AddText(ImVec2(c.x - 250, c.y - 100), ColF(t.text, 1.0f), b);
-
-    ImGui::SetCursorScreenPos(ImVec2(p0.x, p1.y + 8));
-    ImGui::Dummy(ImVec2(1, 1));
-}
-
-static void DrawMiniGameTyping(ImVec2 p0, ImVec2 p1) {
-    ThemeColors t = GetTheme();
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    float dt = ImGui::GetIO().DeltaTime;
-
-    if (!g_mini.running) {
-        if (g_mini.finished) {
-            ImVec2 c((p0.x + p1.x) * 0.5f, (p0.y + p1.y) * 0.5f);
-            ImVec2 ts = ImGui::CalcTextSize(g_mini.message.c_str());
-            dl->AddText(ImVec2(c.x - ts.x * 0.5f, c.y - ts.y * 0.5f), ColF(t.text, 1.0f), g_mini.message.c_str());
-        }
-        return;
-    }
-
-    g_mini.timer += dt;
-    if (g_mini.timer >= g_mini.time_limit) { MiniFinish(); return; }
-    if (g_mini.type_start == 0.0f) g_mini.type_start = g_mini.timer;
-
-    ImVec2 c((p0.x + p1.x) * 0.5f, (p0.y + p1.y) * 0.5f);
-
-    // Целевой текст с подсветкой
-    float x = c.x - 300, y = c.y - 40;
-    for (size_t i = 0; i < g_mini.type_target.size(); i++) {
-        char ch[2] = { g_mini.type_target[i], 0 };
-        ImVec2 sz = ImGui::CalcTextSize(ch);
-        ImU32 col = ColF(t.text_disabled, 1.0f);
-        if (i < g_mini.type_text.size()) {
-            col = (g_mini.type_text[i] == g_mini.type_target[i]) ? IM_COL32(80, 220, 120, 255) : IM_COL32(220, 80, 80, 255);
-        }
-        else if (i == g_mini.type_text.size()) {
-            col = ColF(t.accent, 1.0f);
-        }
-        dl->AddText(ImVec2(x, y), col, ch);
-        x += sz.x;
-    }
-
-    // Поле ввода
-    ImGui::SetCursorScreenPos(ImVec2(c.x - 300, c.y + 30));
-    ImGui::PushID("type_input");
-    ImGui::SetNextItemWidth(600);
-    ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(255, 255, 255, 15));
-    char buf[256];
-    strncpy_s(buf, sizeof(buf), g_mini.type_text.c_str(), _TRUNCATE);
-    if (ImGui::InputText("##ti", buf, IM_ARRAYSIZE(buf))) {
-        g_mini.type_text = buf;
-    }
-    ImGui::PopStyleColor();
-    ImGui::PopID();
-
-    // Проверка завершения
-    if (g_mini.type_text == g_mini.type_target) {
-        float secs = g_mini.timer - g_mini.type_start;
-        float wpm = (float)g_mini.type_target.size() / 5.0f / (secs / 60.0f);
-        g_mini.score = (int)wpm;
-        MiniFinish();
-    }
-
-    float secs = g_mini.timer - g_mini.type_start;
-    char b[64]; snprintf(b, sizeof(b), "Время: %.1f сек", secs);
-    dl->AddText(ImVec2(c.x - 300, c.y - 80), ColF(t.text, 1.0f), b);
-
-    ImGui::SetCursorScreenPos(ImVec2(p0.x, p1.y + 8));
-    ImGui::Dummy(ImVec2(1, 1));
-}
-
-static void DrawMiniGameAim(ImVec2 p0, ImVec2 p1) {
-    ThemeColors t = GetTheme();
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    float dt = ImGui::GetIO().DeltaTime;
-    ImVec2 mp = ImGui::GetIO().MousePos;
-
-    if (!g_mini.running) {
-        if (g_mini.finished) {
-            ImVec2 c((p0.x + p1.x) * 0.5f, (p0.y + p1.y) * 0.5f);
-            ImVec2 ts = ImGui::CalcTextSize(g_mini.message.c_str());
-            dl->AddText(ImVec2(c.x - ts.x * 0.5f, c.y - ts.y * 0.5f), ColF(t.text, 1.0f), g_mini.message.c_str());
-        }
-        return;
-    }
-
-    g_mini.timer += dt;
-    if (g_mini.timer >= g_mini.time_limit) { MiniFinish(); return; }
-
-    g_mini.aim_spawn_t += dt;
-    if (g_mini.aim_spawn_t > 0.7f && g_mini.aim_targets.size() < 3) {
-        g_mini.aim_spawn_t = 0.0f;
-        std::mt19937 rng((unsigned)std::chrono::system_clock::now().time_since_epoch().count());
-        std::uniform_real_distribution<float> dx(p0.x + 60, p1.x - 60);
-        std::uniform_real_distribution<float> dy(p0.y + 60, p1.y - 60);
-        g_mini.aim_targets.push_back(ImVec2(dx(rng), dy(rng)));
-    }
-
-    for (size_t i = 0; i < g_mini.aim_targets.size(); ) {
-        ImVec2 c = g_mini.aim_targets[i];
-        float dx = mp.x - c.x, dy = mp.y - c.y;
-        bool hit = dx * dx + dy * dy <= 30 * 30;
-        dl->AddCircleFilled(c, 30, ColF(t.accent, hit ? 0.9f : 0.6f), 24);
-        dl->AddCircle(c, 30, ColF(t.text, 0.7f), 24, 2.0f);
-        dl->AddCircleFilled(c, 6, IM_COL32(255, 255, 255, 200), 12);
-
-        if (hit && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-            g_mini.score++;
-            g_mini.aim_targets.erase(g_mini.aim_targets.begin() + i);
-        }
-        else i++;
-    }
-
-    char b[64]; snprintf(b, sizeof(b), "Попадания: %d   ·   %.1f", g_mini.score, g_mini.time_limit - g_mini.timer);
-    dl->AddText(ImVec2(p0.x + 20, p0.y + 20), ColF(t.text, 1.0f), b);
-}
-
-static void DrawMiniGamesPage() {
-    ThemeColors t = GetTheme();
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-
-    // Обновляем таймер активной игры
-    if (g_mini.running) {
-        // Обновляется внутри DrawMiniGame*
-    }
-
-    ImGui::Dummy(ImVec2(0, 4));
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 24.0f);
-
-    // Уровень сверху
-    {
-        int lvl = LevelFromXP(g_xp);
-        int cur = XPIntoLevel(g_xp);
-        int need = XPRemaining(g_xp);
-
-        ImVec2 wp = ImGui::GetCursorScreenPos();
-        float width = ImGui::GetContentRegionAvail().x - 48.0f;
-
-        // Рамка
-        dl->AddRectFilled(ImVec2(wp.x, wp.y), ImVec2(wp.x + width, wp.y + 80), ColF(t.accent, 0.10f), 12.0f);
-        dl->AddRect(ImVec2(wp.x, wp.y), ImVec2(wp.x + width, wp.y + 80), ColF(t.accent, 0.55f), 12.0f, 0, 1.5f);
-
-        char lvl_buf[64]; snprintf(lvl_buf, sizeof(lvl_buf), "Уровень %d · %s", lvl, LevelTitle(lvl));
-        dl->AddText(ImVec2(wp.x + 20, wp.y + 12), ColF(t.text, 1.0f), lvl_buf);
-
-        char xp_buf[64]; snprintf(xp_buf, sizeof(xp_buf), "XP: %d / %d", cur, need);
-        ImVec2 xp_sz = ImGui::CalcTextSize(xp_buf);
-        dl->AddText(ImVec2(wp.x + width - xp_sz.x - 20, wp.y + 14), ColF(t.text_disabled, 1.0f), xp_buf);
-
-        // Прогресс-бар
-        ImVec2 b0(wp.x + 20, wp.y + 45);
-        ImVec2 b1(wp.x + width - 20, wp.y + 65);
-        dl->AddRectFilled(b0, b1, IM_COL32(255, 255, 255, 15), 10.0f);
-        float frac = (need > 0) ? (float)cur / need : 0.0f;
-        if (frac > 1.0f) frac = 1.0f;
-        dl->AddRectFilled(b0, ImVec2(b0.x + (b1.x - b0.x) * frac, b1.y), ColF(t.accent, 1.0f), 10.0f);
-
-        ImGui::Dummy(ImVec2(width, 86));
-    }
-
-    // Заголовок
-    ImGui::TextDisabled("Мини-игры");
-    ImGui::Spacing();
-
-    // Если игра активна — рисуем её
-    if (g_mini.current != MiniGame::None) {
-        ImVec2 avail = ImGui::GetContentRegionAvail();
-        float top_h = 60.0f;
-        ImVec2 game_p0 = ImGui::GetCursorScreenPos();
-        ImVec2 game_p1 = ImVec2(game_p0.x + avail.x - 48, game_p0.y + avail.y - top_h);
-
-        // Рамка игровой зоны
-        dl->AddRectFilled(game_p0, game_p1, ColF(t.window_bg, 0.35f), 12.0f);
-        dl->AddRect(game_p0, game_p1, ColF(t.accent, 0.55f), 12.0f, 0, 1.5f);
-
-        // Кнопка "Назад"
-        ImGui::SetCursorScreenPos(ImVec2(game_p0.x + 12, game_p0.y + 12));
-        ImGui::PushStyleColor(ImGuiCol_Button, ColF(t.accent, 0.20f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ColF(t.accent, 0.35f));
-        if (ImGui::Button("← К списку", ImVec2(120, 30))) {
-            g_mini = MiniGameState{};
-        }
-        ImGui::PopStyleColor(2);
-
-        // Название
-        dl->AddText(ImVec2(game_p0.x + 150, game_p0.y + 18), ColF(t.text, 1.0f), MiniName(g_mini.current));
-
-        // Игровая зона
-        switch (g_mini.current) {
-        case MiniGame::Reaction: DrawMiniGameReaction(game_p0, game_p1); break;
-        case MiniGame::Memory:   DrawMiniGameMemory(game_p0, game_p1); break;
-        case MiniGame::Clicker:  DrawMiniGameClicker(game_p0, game_p1); break;
-        case MiniGame::Math:     DrawMiniGameMath(game_p0, game_p1); break;
-        case MiniGame::Snake:    DrawMiniGameSnake(game_p0, game_p1); break;
-        case MiniGame::Color:    DrawMiniGameColor(game_p0, game_p1); break;
-        case MiniGame::Typing:   DrawMiniGameTyping(game_p0, game_p1); break;
-        case MiniGame::Aim:      DrawMiniGameAim(game_p0, game_p1); break;
-        default: break;
-        }
-
-        ImGui::SetCursorScreenPos(ImVec2(game_p0.x, game_p1.y + 4));
-        ImGui::Dummy(ImVec2(1, 1));
-    }
-    else {
-        // Сетка игр
-        ImVec2 avail = ImGui::GetContentRegionAvail();
-        int cols = 4;
-        float gap = 14.0f;
-        float cw = (avail.x - 48 - gap * (cols - 1)) / cols;
-        float ch = 180.0f;
-        ImVec2 origin = ImGui::GetCursorScreenPos();
-        origin.x += 0;
-
-        ImVec2 mp = ImGui::GetIO().MousePos;
-        int idx = 0;
-        for (int g = 1; g < (int)MiniGame::Count; g++) {
-            int col = idx % cols, row = idx / cols;
-            ImVec2 p0(origin.x + col * (cw + gap), origin.y + row * (ch + gap));
-            ImVec2 p1(p0.x + cw, p0.y + ch);
-            bool hv = mp.x >= p0.x && mp.x <= p1.x && mp.y >= p0.y && mp.y <= p1.y;
-
-            ImU32 bg = hv ? ColF(t.accent, 0.18f) : ColF(t.window_bg, 0.35f);
-            dl->AddRectFilled(p0, p1, bg, 12.0f);
-            dl->AddRect(p0, p1, ColF(t.accent, hv ? 1.0f : 0.45f), 12.0f, 0, 1.5f);
-
-            dl->AddText(ImVec2(p0.x + 16, p0.y + 14), ColF(t.text, 1.0f), MiniName((MiniGame)g));
-            dl->AddText(ImVec2(p0.x + 16, p0.y + 40), ColF(t.text_disabled, 1.0f), MiniDesc((MiniGame)g));
-
-            // Звёзды
-            DrawStarsInline(dl, ImVec2(p0.x + 20, p0.y + ch - 70), g_mini_scores[g].stars, 18.0f);
-
-            // Лучший результат
-            char b[64];
-            if (g == (int)MiniGame::Reaction)
-                snprintf(b, sizeof(b), "Лучший: %d мс", g_mini_scores[g].best);
-            else
-                snprintf(b, sizeof(b), "Лучший: %d", g_mini_scores[g].best);
-            dl->AddText(ImVec2(p0.x + 16, p0.y + ch - 36), ColF(t.text_disabled, 1.0f), b);
-
-            if (hv && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-                MiniStart((MiniGame)g);
-            }
-            idx++;
-        }
-        ImGui::Dummy(ImVec2(avail.x, ((idx + cols - 1) / cols) * (ch + gap)));
-    }
+    if (input_blocked) ImGui::EndDisabled();
 }
 
 // ============================================================
@@ -3390,7 +2444,7 @@ static void DrawLibraryPage() {
     if (busy) ImGui::BeginDisabled();
 
     ImGui::Dummy(ImVec2(0, 4));
-    ImGui::Indent(32.0f);
+    ImGui::Indent(24.0f);
     if (ImGui::Button("Обновить список", ImVec2(180, 34))) { RefreshInstalledFiles(); RefreshInstalledFlags(); LogPush("Список библиотеки обновлён"); }
     ImGui::SameLine(0, 12);
     if (ImGui::Button("Открыть папку Lua", ImVec2(180, 34))) OpenLuaFolder();
@@ -3398,7 +2452,9 @@ static void DrawLibraryPage() {
     ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
 
     if (g_app.installed.empty()) {
+        ImGui::Indent(24.0f);
         ImGui::TextDisabled("В библиотеке пока нет установленных игр.");
+        ImGui::Unindent(24.0f);
         if (busy) ImGui::EndDisabled();
         return;
     }
@@ -3453,9 +2509,7 @@ static void DrawFxButton(const char* label, FxMode mode) {
     }
     if (ImGui::Button(label, ImVec2(140, 34))) {
         g_fx = mode;
-        g_stat_fx++; SaveSettings();
-        UnlockAchievement("fx_change");
-        if (g_stat_fx >= 20) UnlockAchievement("fx_all");
+        SaveSettings();
     }
     if (active) ImGui::PopStyleColor(3);
 }
@@ -3469,9 +2523,7 @@ static void DrawThemeButton(const char* label, ThemeMode mode) {
     }
     if (ImGui::Button(label, ImVec2(120, 34))) {
         g_theme = mode; ApplyStyle();
-        g_stat_theme++; SaveSettings();
-        UnlockAchievement("theme_change");
-        if (g_stat_theme >= 20) UnlockAchievement("theme_all");
+        SaveSettings();
     }
     if (active) ImGui::PopStyleColor(3);
 }
@@ -3489,7 +2541,7 @@ static void DrawCustomGradientPopup() {
     ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(700, 480), ImGuiCond_Always);
 
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 14.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(24, 20));
     ImGui::PushStyleColor(ImGuiCol_PopupBg, ImVec4(t.window_bg.x + 0.02f, t.window_bg.y + 0.02f, t.window_bg.z + 0.04f, 0.99f));
     ImGui::PushStyleColor(ImGuiCol_Border, ColF(t.accent, 0.6f));
@@ -3535,7 +2587,7 @@ static void DrawCustomGradientPopup() {
                 IM_COL32((int)(g_custom_color_b[0] * 255), (int)(g_custom_color_b[1] * 255), (int)(g_custom_color_b[2] * 255), 255),
                 IM_COL32((int)(g_custom_color_b[0] * 255), (int)(g_custom_color_b[1] * 255), (int)(g_custom_color_b[2] * 255), 255),
                 IM_COL32((int)(g_custom_color_a[0] * 255), (int)(g_custom_color_a[1] * 255), (int)(g_custom_color_a[2] * 255), 255));
-            dl->AddRect(pv0, pv1, ColF(t.accent, 0.5f), 10.0f, 0, 1.5f);
+            dl->AddRect(pv0, pv1, ColF(t.accent, 0.5f), 0.0f, 0, 1.5f);
             ImGui::Dummy(ImVec2(pv_w, 52.0f));
         }
 
@@ -3552,9 +2604,7 @@ static void DrawCustomGradientPopup() {
         if (ImGui::Button("Применить", ImVec2(btn_w, btn_h))) {
             g_theme = ThemeMode::Custom;
             ApplyStyle();
-            UnlockAchievement("gradient");
             SaveSettings();
-            PushToast("Свой градиент применён");
             ImGui::CloseCurrentPopup();
         }
         ImGui::PopStyleColor(3);
@@ -3632,18 +2682,52 @@ static void DrawToolsPage() {
     ImGui::Spacing();
     ImGui::TextDisabled("Погодные эффекты");
     bool s1 = g_fx_snow, s2 = g_fx_rain, s3 = g_fx_leaves;
-    if (ImGui::Checkbox("Снег", &s1)) { g_fx_snow = s1; g_stat_weather++; if (s1) UnlockAchievement("snow_on"); SaveSettings(); }
+    if (ImGui::Checkbox("Снег", &s1)) { g_fx_snow = s1; SaveSettings(); }
     ImGui::SameLine();
-    if (ImGui::Checkbox("Дождь", &s2)) { g_fx_rain = s2; g_stat_weather++; if (s2) UnlockAchievement("rain_on"); SaveSettings(); }
+    if (ImGui::Checkbox("Дождь", &s2)) { g_fx_rain = s2; SaveSettings(); }
     ImGui::SameLine();
-    if (ImGui::Checkbox("Листья", &s3)) { g_fx_leaves = s3; g_stat_weather++; if (s3) UnlockAchievement("leaves_on"); SaveSettings(); }
-    if (g_fx_snow && g_fx_rain && g_fx_leaves) UnlockAchievement("weather_all");
-
-    ImGui::Spacing();
-    ImGui::TextDisabled("Прочее");
+    if (ImGui::Checkbox("Листья", &s3)) { g_fx_leaves = s3; SaveSettings(); }
 
     ImGui::Unindent(24.0f);
     if (busy) ImGui::EndDisabled();
+}
+
+// ============================================================
+//  ЛОГИ
+// ============================================================
+static void DrawLogsPage() {
+    ThemeColors t = GetTheme();
+    ImGui::Dummy(ImVec2(0, 4));
+    ImGui::Indent(24.0f);
+
+    if (ImGui::Button("Очистить логи", ImVec2(180, 34))) {
+        std::lock_guard<std::mutex> lk(g_app.log_mtx);
+        g_app.log.clear();
+        g_app.notifications_count = 0;
+    }
+    ImGui::Unindent(24.0f);
+    ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
+
+    ImGui::Indent(24.0f);
+    ImGui::BeginChild("##log_scroll", ImVec2(0, 0), false);
+    std::lock_guard<std::mutex> lk(g_app.log_mtx);
+    for (auto& e : g_app.log) {
+        std::time_t tt = std::chrono::system_clock::to_time_t(e.time);
+        std::tm tm; localtime_s(&tm, &tt);
+        char time_buf[32];
+        snprintf(time_buf, sizeof(time_buf), "%02d:%02d:%02d", tm.tm_hour, tm.tm_min, tm.tm_sec);
+
+        ImGui::PushStyleColor(ImGuiCol_Text, e.is_error ? ImVec4(1.0f, 0.4f, 0.4f, 1.0f) : t.text_disabled);
+        ImGui::Text("[%s]", time_buf);
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Text, e.is_error ? ImVec4(1.0f, 0.5f, 0.5f, 1.0f) : t.text);
+        ImGui::TextWrapped("%s", e.text.c_str());
+        ImGui::PopStyleColor();
+        ImGui::Separator();
+    }
+    ImGui::EndChild();
+    ImGui::Unindent(24.0f);
 }
 
 // ============================================================
@@ -3670,8 +2754,8 @@ static void DrawOverlayAndProgress() {
     if (mode != ProgressMode::None) {
         const float ww = 560.0f, wh = 200.0f;
         float wx = (io.DisplaySize.x - ww) * 0.5f, wy = (io.DisplaySize.y - wh) * 0.5f;
-        fg->AddRectFilled(ImVec2(wx, wy), ImVec2(wx + ww, wy + wh), IM_COL32(20, 16, 32, 255), 14.0f);
-        fg->AddRect(ImVec2(wx, wy), ImVec2(wx + ww, wy + wh), ColF(t.accent, 0.6f), 14.0f, 0, 1.5f);
+        fg->AddRectFilled(ImVec2(wx, wy), ImVec2(wx + ww, wy + wh), IM_COL32(20, 16, 32, 255));
+        fg->AddRect(ImVec2(wx, wy), ImVec2(wx + ww, wy + wh), ColF(t.accent, 0.6f), 0.0f, 0, 1.5f);
         const char* title = "Загрузка манифеста";
         const char* sub = "удалит скачанное этой игры";
         ImU32 bar = ColF(t.accent, 1.0f);
@@ -3680,9 +2764,9 @@ static void DrawOverlayAndProgress() {
         fg->AddText(ImVec2(wx + 24, wy + 20), ColF(t.accent, 1.0f), title);
         { std::lock_guard<std::mutex> lk(g_app.status_mtx); fg->AddText(ImVec2(wx + 24, wy + 52), IM_COL32(230, 230, 240, 255), g_app.current_name.c_str()); }
         const float bx = wx + 24, by = wy + 92, bw = ww - 48, bh = 24;
-        fg->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bw, by + bh), IM_COL32(255, 255, 255, 20), 12.0f);
+        fg->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bw, by + bh), IM_COL32(255, 255, 255, 20));
         float prog = MY_CLAMP(g_app.progress_display, 0.0f, 1.0f);
-        fg->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bw * prog, by + bh), bar, 12.0f);
+        fg->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bw * prog, by + bh), bar);
         char b[48];
         if (mode == ProgressMode::Delete) snprintf(b, sizeof(b), "Удаление... %.0f%%", prog * 100.0f);
         else snprintf(b, sizeof(b), "%.0f%%", prog * 100.0f);
@@ -3694,7 +2778,7 @@ static void DrawOverlayAndProgress() {
             ImVec2 mp = io.MousePos;
             bool hv = mp.x >= bbx && mp.x <= bbx + bbw && mp.y >= bby && mp.y <= bby + bbh;
             ImU32 bc = hv ? IM_COL32(230, 90, 90, 255) : IM_COL32(190, 65, 65, 255);
-            fg->AddRectFilled(ImVec2(bbx, bby), ImVec2(bbx + bbw, bby + bbh), bc, 8.0f);
+            fg->AddRectFilled(ImVec2(bbx, bby), ImVec2(bbx + bbw, bby + bbh), bc);
             ImVec2 cts = ImGui::CalcTextSize("Отмена");
             fg->AddText(ImVec2(bbx + (bbw - cts.x) * 0.5f, bby + (bbh - cts.y) * 0.5f), IM_COL32(255, 255, 255, 255), "Отмена");
             if (hv && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) CancelCurrentDownload();
@@ -3703,77 +2787,76 @@ static void DrawOverlayAndProgress() {
 
     if (g_app.success_visible) {
         g_app.success_timer += dt;
-        const float t_in = 0.15f, t_hold = 0.35f, t_out = 0.20f;
+        const float t_in = 0.18f, t_hold = 0.90f, t_out = 0.45f;
         float total = t_in + t_hold + t_out;
-        if (g_app.success_timer < t_in) g_app.success_alpha = g_app.success_timer / t_in;
-        else if (g_app.success_timer < t_in + t_hold) g_app.success_alpha = 1.0f;
-        else if (g_app.success_timer < total) g_app.success_alpha = 1.0f - (g_app.success_timer - t_in - t_hold) / t_out;
-        else { g_app.success_alpha = 0.0f; g_app.success_visible = false; g_app.success_timer = 0.0f; }
-        if (g_app.success_visible && g_app.success_alpha > 0.001f) {
-            float cx = io.DisplaySize.x * 0.5f, cy = io.DisplaySize.y * 0.5f, a = g_app.success_alpha;
-            fg->AddCircleFilled(ImVec2(cx, cy), 90.0f, ColF(t.accent, 0.7f * a));
-            fg->AddCircleFilled(ImVec2(cx, cy), 72.0f, ColF(t.accent, a));
-            const float th = 10.0f;
-            ImVec2 A(cx - 28, cy + 2), B(cx - 6, cy + 24), C(cx + 30, cy - 20);
-            fg->AddLine(A, B, IM_COL32(255, 255, 255, (int)(255 * a)), th);
-            fg->AddLine(B, C, IM_COL32(255, 255, 255, (int)(255 * a)), th);
+        if (g_app.success_timer < t_in) {
+            float p = g_app.success_timer / t_in;
+            g_app.success_alpha = 1.0f - (1.0f - p) * (1.0f - p);
         }
-    }
-}
-
-// ============================================================
-//  ТОСТЫ
-// ============================================================
-static void DrawToasts() {
-    ThemeColors t = GetTheme();
-    float dt = ImGui::GetIO().DeltaTime; if (dt <= 0.0f) dt = 0.016f;
-    for (auto& tt : g_toasts) tt.timer += dt;
-    while (!g_toasts.empty() && g_toasts.front().timer > 2.5f) g_toasts.pop_front();
-
-    ImDrawList* fg = ImGui::GetForegroundDrawList();
-    ImVec2 scr = ImGui::GetIO().DisplaySize;
-    float y = 80.0f;
-    for (size_t i = 0; i < g_toasts.size(); ++i) {
-        auto& tt = g_toasts[i];
-        float a = 1.0f;
-        if (tt.timer < 0.2f) a = tt.timer / 0.2f;
-        else if (tt.timer > 2.0f) a = 1.0f - (tt.timer - 2.0f) / 0.5f;
-        if (a < 0.01f) { y += 52; continue; }
-
-        ImVec2 ts = ImGui::CalcTextSize(tt.text.c_str());
-        float w = ts.x + 60.0f, h = 40.0f;
-        ImVec2 p0(scr.x - w - 24.0f, y);
-        ImVec2 p1(p0.x + w, p0.y + h);
-
-        ImU32 bg = ColF(t.window_bg, 0.95f * a);
-        ImU32 bd = tt.is_achievement ? IM_COL32(255, 200, 60, (int)(255 * a)) : ColF(t.accent, 0.8f * a);
-        ImU32 accent = tt.is_achievement ? IM_COL32(255, 200, 60, (int)(255 * a)) : ColF(t.accent, a);
-
-        fg->AddRectFilled(p0, p1, bg, 10.0f);
-        fg->AddRect(p0, p1, bd, 10.0f, 0, 1.5f);
-
-        ImVec2 c(p0.x + 22.0f, p0.y + h * 0.5f);
-        fg->AddCircleFilled(c, 11.0f, tt.is_achievement
-            ? IM_COL32(255, 200, 60, (int)(60 * a))
-            : ColF(t.accent, 0.25f * a));
-
-        if (tt.is_achievement) {
-            ImVec2 pts[10];
-            float R = 7.0f, r = R * 0.45f;
-            for (int k = 0; k < 10; k++) {
-                float ang = -1.5707963f + k * 3.1415926f / 5.0f;
-                float rr = (k % 2 == 0) ? R : r;
-                pts[k] = ImVec2(c.x + std::cos(ang) * rr, c.y + std::sin(ang) * rr);
-            }
-            fg->AddConvexPolyFilled(pts, 10, accent);
+        else if (g_app.success_timer < t_in + t_hold) {
+            g_app.success_alpha = 1.0f;
+        }
+        else if (g_app.success_timer < total) {
+            float p = (g_app.success_timer - t_in - t_hold) / t_out;
+            g_app.success_alpha = 1.0f - p;
         }
         else {
-            fg->AddLine(ImVec2(c.x - 5, c.y), ImVec2(c.x - 1, c.y + 4), accent, 2.0f);
-            fg->AddLine(ImVec2(c.x - 1, c.y + 4), ImVec2(c.x + 6, c.y - 5), accent, 2.0f);
+            g_app.success_alpha = 0.0f;
+            g_app.success_visible = false;
+            g_app.success_timer = 0.0f;
         }
+        if (g_app.success_visible && g_app.success_alpha > 0.001f) {
+            float cx = io.DisplaySize.x * 0.5f, cy = io.DisplaySize.y * 0.5f;
+            float a = g_app.success_alpha;
 
-        fg->AddText(ImVec2(p0.x + 42.0f, p0.y + (h - ts.y) * 0.5f), ColF(t.text, a), tt.text.c_str());
-        y += h + 10.0f;
+            float draw_p = g_app.success_timer / 0.35f;
+            if (draw_p < 0.0f) draw_p = 0.0f; if (draw_p > 1.0f) draw_p = 1.0f;
+            float dp = 1.0f - draw_p; dp = 1.0f - dp * dp * dp;
+
+            for (int i = 4; i >= 1; i--) {
+                float r = 72.0f + i * 8.0f;
+                fg->AddCircleFilled(ImVec2(cx, cy), r, ColF(t.accent, 0.08f * a * (5 - i) / 4.0f), 64);
+            }
+            fg->AddCircleFilled(ImVec2(cx, cy), 84.0f, ColF(t.accent, 0.28f * a), 64);
+            float ring_r = 72.0f;
+            for (int k = 0; k < 5; k++) {
+                float rr = ring_r - k * 1.6f;
+                fg->AddCircle(ImVec2(cx, cy), rr, ColF(t.accent, a), 64, 2.0f);
+            }
+            fg->AddCircleFilled(ImVec2(cx, cy), ring_r - 8.0f, ColF(t.accent, 0.10f * a), 64);
+            fg->PathClear();
+            fg->PathArcTo(ImVec2(cx, cy), ring_r - 4.0f,
+                3.1415926f * 1.15f, 3.1415926f * 1.85f, 32);
+            fg->PathStroke(IM_COL32(255, 255, 255, (int)(90 * a)), 0, 1.8f);
+
+            ImVec2 A(cx - 30.0f, cy + 2.0f);
+            ImVec2 B(cx - 8.0f, cy + 26.0f);
+            ImVec2 C(cx + 34.0f, cy - 24.0f);
+            float th = 9.0f;
+            ImU32 chk_col = IM_COL32(255, 255, 255, (int)(255 * a));
+
+            if (dp > 0.0f) {
+                float p1 = MY_CLAMP(dp / 0.55f, 0.0f, 1.0f);
+                ImVec2 B1(B.x * p1 + A.x * (1 - p1), B.y * p1 + A.y * (1 - p1));
+                fg->AddLine(A, B1, chk_col, th);
+                fg->AddCircleFilled(B1, th * 0.5f, chk_col, 12);
+                if (dp > 0.55f) {
+                    float p2 = MY_CLAMP((dp - 0.55f) / 0.45f, 0.0f, 1.0f);
+                    ImVec2 C1(C.x * p2 + B.x * (1 - p2), C.y * p2 + B.y * (1 - p2));
+                    fg->AddLine(B, C1, chk_col, th);
+                    if (p2 < 0.99f) fg->AddCircleFilled(B, th * 0.5f, chk_col, 12);
+                }
+            }
+
+            for (int i = 0; i < 8; i++) {
+                float ang = i * (2.0f * 3.1415926f / 8.0f) + g_app.success_timer * 2.0f;
+                float rad = ring_r + 8.0f + std::sin(g_app.success_timer * 6.0f + i) * 3.0f;
+                float px = cx + cosf(ang) * rad;
+                float py = cy + sinf(ang) * rad;
+                float sz = 2.0f + std::sin(g_app.success_timer * 4.0f + i * 1.3f) * 1.0f;
+                fg->AddCircleFilled(ImVec2(px, py), sz, ColF(t.accent, 0.55f * a), 8);
+            }
+        }
     }
 }
 
@@ -3786,29 +2869,103 @@ static void DrawSplashScreen() {
     ThemeColors t = GetTheme();
     float dt = io.DeltaTime; if (dt <= 0.0f) dt = 0.016f;
     g_splash.timer += dt;
+
     bool can_hide = g_splash.ready && g_splash.timer >= g_splash.min_show_time;
     float ta = can_hide ? 0.0f : 1.0f;
     g_splash.alpha += (ta - g_splash.alpha) * 5.5f * dt;
     if (g_splash.alpha < 0.005f && can_hide) { g_splash.active = false; g_splash.alpha = 0.0f; return; }
     float a = MY_CLAMP(g_splash.alpha, 0.0f, 1.0f);
-    fg->AddRectFilled(ImVec2(0, 0), io.DisplaySize, IM_COL32(38, 36, 48, (int)(255 * a)));
-    float cx = io.DisplaySize.x * 0.5f, cy = io.DisplaySize.y * 0.5f;
-    const float R = 34.0f, th = 4.0f;
-    fg->AddCircle(ImVec2(cx, cy), R, IM_COL32(255, 255, 255, (int)(30 * a)), 60, th);
-    float ang = (float)(ImGui::GetTime() * 2.4f);
-    for (int i = 0; i < 20; i++) {
-        float t0 = ang + 3.6f * ((float)i / 20), t1 = ang + 3.6f * ((float)(i + 1) / 20);
-        fg->PathClear(); fg->PathArcTo(ImVec2(cx, cy), R, t0, t1, 4);
-        fg->PathStroke(ColF(t.accent, a * ((float)(i + 1) / 20)), 0, th);
+
+    ImVec2 scr = io.DisplaySize;
+    float cx = scr.x * 0.5f, cy = scr.y * 0.5f;
+    float time = (float)ImGui::GetTime();
+
+    fg->AddRectFilled(ImVec2(0, 0), scr,
+        IM_COL32((int)(t.window_bg.x * 255), (int)(t.window_bg.y * 255), (int)(t.window_bg.z * 255), (int)(255 * a)));
+
+    for (int i = 8; i >= 1; i--) {
+        float r = 140.0f + i * 40.0f;
+        float al = 0.035f * a * (9 - i) / 8.0f;
+        fg->AddCircleFilled(ImVec2(cx, cy - 40.0f), r, ColF(t.accent, al), 64);
     }
-    ImVec2 head(cx + cosf(ang + 3.6f) * R, cy + sinf(ang + 3.6f) * R);
-    fg->AddCircleFilled(head, th * 0.9f, ColF(t.accent, a));
-    if (g_font_title) ImGui::PushFont(g_font_title);
-    ImVec2 tsz = ImGui::CalcTextSize("SteamLuaTools");
-    fg->AddText(ImVec2(cx - tsz.x * 0.5f, cy + R + 30.0f), ColF(t.text, a), "SteamLuaTools");
-    if (g_font_title) ImGui::PopFont();
-    ImVec2 ssz = ImGui::CalcTextSize(g_splash.step_text.c_str());
-    fg->AddText(ImVec2(cx - ssz.x * 0.5f, cy + R + 62.0f), ColF(t.text_disabled, a), g_splash.step_text.c_str());
+
+    float logo_size = 220.0f;
+    float logo_y = cy - logo_size * 0.5f - 40.0f;
+    float logo_x = cx - logo_size * 0.5f;
+
+    if (g_logo_srv) {
+        float pulse = 0.85f + 0.15f * std::sin(time * 1.6f);
+        for (int i = 3; i >= 1; i--) {
+            float e = (float)i * 3.0f;
+            float al = 0.04f * a * pulse / i;
+            fg->AddRectFilled(
+                ImVec2(logo_x - e, logo_y - e),
+                ImVec2(logo_x + logo_size + e, logo_y + logo_size + e),
+                ColF(t.accent, al), 12.0f);
+        }
+        fg->AddImage((ImTextureID)g_logo_srv,
+            ImVec2(logo_x, logo_y),
+            ImVec2(logo_x + logo_size, logo_y + logo_size),
+            ImVec2(0, 0), ImVec2(1, 1),
+            IM_COL32(255, 255, 255, (int)(255 * a)));
+    }
+
+    const char* sign = "Developer by : RodekPlay";
+    float sign_y = logo_y + logo_size + 40.0f;
+
+    if (g_font_huge) ImGui::PushFont(g_font_huge);
+    ImVec2 ssz = ImGui::CalcTextSize(sign);
+    float sxx = cx - ssz.x * 0.5f;
+    {
+        float line_y = sign_y + ssz.y * 0.5f;
+        float gap = 26.0f;
+        float len = 110.0f;
+
+        ImVec2 l0(cx - ssz.x * 0.5f - gap - len, line_y);
+        ImVec2 l1(cx - ssz.x * 0.5f - gap, line_y);
+        fg->AddLine(l0, l1, ColF(t.accent, 0.55f * a), 1.5f);
+        fg->AddCircleFilled(ImVec2(l1.x, l1.y), 2.8f, ColF(t.accent, 0.9f * a), 8);
+
+        ImVec2 r0(cx + ssz.x * 0.5f + gap, line_y);
+        ImVec2 r1(cx + ssz.x * 0.5f + gap + len, line_y);
+        fg->AddLine(r0, r1, ColF(t.accent, 0.55f * a), 1.5f);
+        fg->AddCircleFilled(ImVec2(r0.x, r0.y), 2.8f, ColF(t.accent, 0.9f * a), 8);
+    }
+    fg->AddText(ImVec2(sxx, sign_y), ColF(t.accent, a), sign);
+    if (g_font_huge) ImGui::PopFont();
+
+    const char* status = g_splash.step_text.c_str();
+    ImVec2 sts = ImGui::CalcTextSize(status);
+    float status_y = sign_y + ssz.y + 22.0f;
+    fg->AddText(ImVec2(cx - sts.x * 0.5f, status_y), ColF(t.text_disabled, a), status);
+
+    {
+        float bar_w = 320.0f;
+        float bar_h = 3.0f;
+        float bar_x = cx - bar_w * 0.5f;
+        float bar_y = status_y + sts.y + 18.0f;
+
+        fg->AddRectFilled(ImVec2(bar_x, bar_y), ImVec2(bar_x + bar_w, bar_y + bar_h),
+            ColF(t.text, 0.10f * a));
+
+        float seg_w = 90.0f;
+        float total = bar_w + seg_w;
+        float pos = fmodf(time * 180.0f, total) - seg_w;
+        float x0 = bar_x + (pos < 0 ? 0 : pos);
+        float x1 = bar_x + (pos + seg_w > bar_w ? bar_w : pos + seg_w);
+
+        if (x1 > x0) {
+            fg->AddRectFilled(ImVec2(x0, bar_y), ImVec2(x1, bar_y + bar_h),
+                ColF(t.accent, 0.95f * a));
+            for (int i = 3; i >= 1; i--) {
+                float e = (float)i * 2.0f;
+                fg->AddRectFilled(
+                    ImVec2(x0 - e, bar_y - e),
+                    ImVec2(x1 + e, bar_y + bar_h + e),
+                    ColF(t.accent, 0.08f * a / i));
+            }
+        }
+    }
 }
 
 // ============================================================
@@ -3840,7 +2997,14 @@ static void DrawUI() {
     float ta = EaseOutCubic(MY_CLAMP(g_app.app_open_anim, 0, 1)) * EaseOutCubic(MY_CLAMP(g_app.tab_fade, 0, 1));
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ta);
 
-    DrawTopBar();
+    DrawSidebar();
+    ImGui::SameLine(0, 0);
+
+    ImGui::BeginChild("##main_area", ImVec2(0, 0), false, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    ImGui::BeginChild("##main_area_pad", ImVec2(0, 0), false, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+
+    DrawMainTopBar();
 
     ImGui::BeginChild("##content", ImVec2(0, 0), false, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
@@ -3848,11 +3012,9 @@ static void DrawUI() {
 
     switch (g_app.current_tab) {
     case 0: DrawShopPage(); break;
-    case 1: DrawFavoritesPage(); break;
-    case 2: DrawAchievementsPage(); break;
-    case 3: DrawMiniGamesPage(); break;
-    case 4: DrawLibraryPage(); break;
-    case 5: DrawToolsPage(); break;
+    case 1: DrawLibraryPage(); break;
+    case 2: DrawToolsPage(); break;
+    case 3: DrawLogsPage(); break;
     default: break;
     }
 
@@ -3861,11 +3023,30 @@ static void DrawUI() {
     ImGui::EndChild();
     ImGui::PopStyleVar();
     ImGui::EndChild();
+
+    ImGui::EndChild();
+    ImGui::PopStyleVar();
+    ImGui::EndChild();
+
     ImGui::PopStyleVar();
     ImGui::End();
 
+    if (IsInputBlocked()) {
+        ImGui::SetNextWindowPos(vp->WorkPos);
+        ImGui::SetNextWindowSize(vp->WorkSize);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32(0, 0, 0, 0));
+        ImGui::Begin("##click_blocker", nullptr,
+            ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+            ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+            ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus |
+            ImGuiWindowFlags_NoNavFocus);
+        ImGui::End();
+        ImGui::PopStyleColor();
+        ImGui::PopStyleVar();
+    }
+
     DrawOverlayAndProgress();
-    DrawToasts();
     ProcessPendingTextures();
 
     if (g_splash.active) DrawSplashScreen();
@@ -3878,32 +3059,43 @@ static std::atomic<bool> g_init_done{ false };
 
 static void BackgroundInitThread() {
     g_splash.step_text = "Загрузка настроек...";
-    InitAchievements();
+    LogPush("=== SteamLuaTools 10.0 запуск ===");
+    LogPush("Путь настроек: " + GetSettingsPath());
     LoadSettings();
     ApplyStyle();
+    LogPush("Настройки загружены. Тема: " + std::to_string((int)g_theme) + ", FX: " + std::to_string((int)g_fx));
 
     g_splash.step_text = "Поиск Steam...";
+    LogPush("Поиск Steam...");
     g_app_steam_path = FindSteamPath();
     g_app.steam_found = !g_app_steam_path.empty();
-    if (g_app.steam_found) LogPush("Steam найден: " + g_app_steam_path);
+    if (g_app.steam_found) {
+        LogPush("Steam найден: " + g_app_steam_path);
+        LogPush("Папка Lua: " + (fs::path(g_app_steam_path) / "config" / "lua").string());
+        LogPush("Папка Depotcache: " + (fs::path(g_app_steam_path) / "depotcache").string());
+    }
     else LogPush("Steam не найден в системе", true);
 
     g_splash.step_text = "Загрузка базы игр...";
-    LoadGamesJson();
+    LogPush("Загрузка базы игр gamespic.json...");
+    if (LoadGamesJson()) {
+        LogPush("Загружено игр: " + std::to_string(g_app.all_games.size()));
+        LogPush("Доступно тегов: " + std::to_string((int)g_app.available_tags.size()));
+    }
+    else {
+        LogPush("Не удалось загрузить базу игр gamespic.json", true);
+    }
+
     LoadSettings();
     RefreshInstalledFlags();
     RefreshInstalledFiles();
-    RebuildFiltered();
+    LogPush("Установленных игр (lua-файлов): " + std::to_string(g_app.installed.size()));
 
-    // Проверка времени суток
-    {
-        time_t now = time(nullptr);
-        std::tm tm; localtime_s(&tm, &now);
-        if (tm.tm_hour >= 0 && tm.tm_hour < 5) UnlockAchievement("night_owl");
-        if (tm.tm_hour >= 0 && tm.tm_hour < 6) UnlockAchievement("early_bird");
-    }
+    RebuildFiltered();
+    LogPush("Отфильтровано записей: " + std::to_string(g_app.filtered.size()));
 
     g_splash.step_text = "Готово";
+    LogPush("=== Инициализация завершена ===");
     g_init_done = true;
 }
 
@@ -3941,6 +3133,135 @@ static void CreateRenderTarget() {
     ID3D11Texture2D* back = nullptr;
     g_pSwapChain->GetBuffer(0, IID_PPV_ARGS(&back));
     if (back) { g_pd3dDevice->CreateRenderTargetView(back, nullptr, &g_mainRenderTargetView); back->Release(); }
+}
+static bool LoadSmallIconTexture() {
+    HINSTANCE hInst = GetModuleHandle(nullptr);
+    HICON hIcon = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(IDI_ICON1), IMAGE_ICON, 64, 64, LR_DEFAULTCOLOR);
+    if (!hIcon) return false;
+
+    ICONINFO ii = {};
+    if (!GetIconInfo(hIcon, &ii)) { DestroyIcon(hIcon); return false; }
+
+    BITMAP bm = {};
+    GetObject(ii.hbmColor, sizeof(bm), &bm);
+    int w = bm.bmWidth, h = bm.bmHeight;
+    if (w <= 0 || h <= 0) {
+        if (ii.hbmColor) DeleteObject(ii.hbmColor);
+        if (ii.hbmMask) DeleteObject(ii.hbmMask);
+        DestroyIcon(hIcon);
+        return false;
+    }
+
+    BITMAPINFO bi = {};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+
+    std::vector<unsigned char> pixels((size_t)w * h * 4, 0);
+    HDC hdc = GetDC(nullptr);
+    int ok = GetDIBits(hdc, ii.hbmColor, 0, h, pixels.data(), &bi, DIB_RGB_COLORS);
+    ReleaseDC(nullptr, hdc);
+
+    if (ii.hbmColor) DeleteObject(ii.hbmColor);
+    if (ii.hbmMask) DeleteObject(ii.hbmMask);
+    DestroyIcon(hIcon);
+
+    if (!ok) return false;
+
+    for (int i = 0; i < w * h; i++) {
+        unsigned char tmp = pixels[i * 4 + 0];
+        pixels[i * 4 + 0] = pixels[i * 4 + 2];
+        pixels[i * 4 + 2] = tmp;
+    }
+
+    D3D11_TEXTURE2D_DESC desc = {};
+    desc.Width = w; desc.Height = h; desc.MipLevels = 1; desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    D3D11_SUBRESOURCE_DATA sub = {};
+    sub.pSysMem = pixels.data();
+    sub.SysMemPitch = w * 4;
+
+    ID3D11Texture2D* tex = nullptr;
+    if (FAILED(g_pd3dDevice->CreateTexture2D(&desc, &sub, &tex))) return false;
+    HRESULT hr = g_pd3dDevice->CreateShaderResourceView(tex, nullptr, &g_icon_small_srv);
+    tex->Release();
+    if (FAILED(hr)) return false;
+
+    g_icon_small_w = w;
+    g_icon_small_h = h;
+    return true;
+}
+static void ApplySoftEdge(std::vector<unsigned char>& px, int w, int h, float soft_frac) {
+    int soft_x = (int)(w * soft_frac);
+    int soft_y = (int)(h * soft_frac);
+    if (soft_x < 1) soft_x = 1;
+    if (soft_y < 1) soft_y = 1;
+
+    for (int y = 0; y < h; y++) {
+        float fy = 1.0f;
+        if (y < soft_y)          fy = (float)y / soft_y;
+        else if (y >= h - soft_y) fy = (float)(h - 1 - y) / soft_y;
+        if (fy < 0) fy = 0; if (fy > 1) fy = 1;
+
+        for (int x = 0; x < w; x++) {
+            float fx = 1.0f;
+            if (x < soft_x)          fx = (float)x / soft_x;
+            else if (x >= w - soft_x) fx = (float)(w - 1 - x) / soft_x;
+            if (fx < 0) fx = 0; if (fx > 1) fx = 1;
+
+            float fade = fx * fy;
+            unsigned char* p = &px[(y * w + x) * 4 + 3];
+            *p = (unsigned char)(*p * fade);
+        }
+    }
+}
+
+static bool LoadLogoTexture() {
+    const char* candidates[] = { "logo.png", "./logo.png", "../logo.png" };
+    std::string path;
+    for (auto p : candidates) if (fs::exists(p)) { path = p; break; }
+    if (path.empty()) return false;
+
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    std::vector<unsigned char> raw((std::istreambuf_iterator<char>(f)),
+        std::istreambuf_iterator<char>());
+    if (raw.empty()) return false;
+
+    int w, h, comp;
+    unsigned char* pixels = stbi_load_from_memory(raw.data(), (int)raw.size(), &w, &h, &comp, 4);
+    if (!pixels) return false;
+
+    std::vector<unsigned char> px(pixels, pixels + (size_t)w * h * 4);
+    stbi_image_free(pixels);
+
+    ApplySoftEdge(px, w, h, 0.06f);
+
+    D3D11_TEXTURE2D_DESC desc = {};
+    desc.Width = w; desc.Height = h; desc.MipLevels = 1; desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    D3D11_SUBRESOURCE_DATA sub = {};
+    sub.pSysMem = px.data();
+    sub.SysMemPitch = w * 4;
+
+    ID3D11Texture2D* tex = nullptr;
+    if (FAILED(g_pd3dDevice->CreateTexture2D(&desc, &sub, &tex))) return false;
+    HRESULT hr = g_pd3dDevice->CreateShaderResourceView(tex, nullptr, &g_logo_srv);
+    tex->Release();
+    if (FAILED(hr)) return false;
+
+    g_logo_w = w;
+    g_logo_h = h;
+    return true;
 }
 static void CleanupRenderTarget() {
     if (g_mainRenderTargetView) { g_mainRenderTargetView->Release(); g_mainRenderTargetView = nullptr; }
@@ -3987,7 +3308,9 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR,
     int px = (sw - win_w) / 2;
     int py = (sh - win_h) / 2;
 
-    HWND hwnd = ::CreateWindowW(wc.lpszClassName, L"SteamLuaTools 9.5",
+    HWND hwnd = ::CreateWindowExW(
+        WS_EX_LAYERED,
+        wc.lpszClassName, L"SteamLuaTools 10.0",
         WS_POPUP | WS_MINIMIZEBOX, px, py, win_w, win_h,
         nullptr, nullptr, wc.hInstance, nullptr);
     g_hwnd = hwnd;
@@ -3998,8 +3321,11 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR,
 
     ::ShowWindow(hwnd, SW_SHOW);
     ::UpdateWindow(hwnd);
+    SetLayeredWindowAttributes(hwnd, 0, 0, LWA_ALPHA);
 
     if (!CreateDeviceD3D(hwnd)) {
+        if (g_icon_small_srv) { g_icon_small_srv->Release(); g_icon_small_srv = nullptr; }
+        if (g_logo_srv) { g_logo_srv->Release(); g_logo_srv = nullptr; }
         CleanupDeviceD3D();
         ::UnregisterClassW(wc.lpszClassName, wc.hInstance);
         return 1;
@@ -4016,6 +3342,8 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR,
 
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
+    LoadSmallIconTexture();
+    LoadLogoTexture();
 
     g_splash.active = true;
     g_splash.ready = false;
@@ -4025,6 +3353,10 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR,
     g_init_done = false;
 
     std::thread(BackgroundInitThread).detach();
+
+    float window_fade = 0.0f;
+    const float fade_duration = 0.55f;
+    bool  layered_done = false;
 
     bool done = false;
     while (!done) {
@@ -4057,6 +3389,22 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR,
         g_pd3dDeviceContext->ClearRenderTargetView(g_mainRenderTargetView, clear);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
 
+        if (!layered_done) {
+            window_fade += ImGui::GetIO().DeltaTime / fade_duration;
+            if (window_fade >= 1.0f) {
+                window_fade = 1.0f;
+                layered_done = true;
+                LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex & ~WS_EX_LAYERED);
+            }
+            else {
+                float p = 1.0f - window_fade;
+                float eased = 1.0f - p * p * p;
+                BYTE a = (BYTE)(eased * 255.0f);
+                SetLayeredWindowAttributes(hwnd, 0, a, LWA_ALPHA);
+            }
+        }
+
         g_pSwapChain->Present(1, 0);
     }
 
@@ -4064,6 +3412,8 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR,
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
     for (auto& g : g_app.all_games) if (g.texture) g.texture->Release();
+    if (g_icon_small_srv) { g_icon_small_srv->Release(); g_icon_small_srv = nullptr; }
+    if (g_logo_srv) { g_logo_srv->Release(); g_logo_srv = nullptr; }
     CleanupDeviceD3D();
     ::DestroyWindow(hwnd);
     ::UnregisterClassW(wc.lpszClassName, wc.hInstance);
