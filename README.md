@@ -2,7 +2,7 @@
   <img src="https://img.shields.io/badge/Версия-10.1-red?style=plastic">
   <img src="https://img.shields.io/badge/Дата-2026.17.03-blue?style=plastic">
   <img src="https://img.shields.io/badge/Скачивания-100+-brightgreen?style=plastic">
-  https://img.shields.io/github/stars/rodekplay/SteamLuaTools?style=plastic&label=Stars&color=yellow&cacheSeconds=3600
+  <img src="https://img.shields.io/github/stars/rodekplay/SteamLuaTools?style=plastic&label=Stars&color=yellow">
   <img src="https://img.shields.io/github/forks/rodekplay/SteamLuaTools?style=plastic&label=Forks&color=orange">
 </p>
 
