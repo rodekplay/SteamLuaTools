@@ -1,5 +1,5 @@
 // ============================================================
-//  SteamLuaTools 10.0
+//  SteamLuaTools 10.1
 // ============================================================
 #pragma execution_character_set("utf-8")
 #pragma warning(disable: 4061)
@@ -655,7 +655,7 @@ static bool HttpGetBinary(const std::string& url, std::vector<unsigned char>& ou
     uc.lpszUrlPath = path; uc.dwUrlPathLength = 2047;
     if (!WinHttpCrackUrl(wurl.c_str(), 0, 0, &uc)) return false;
     bool https = (uc.nScheme == INTERNET_SCHEME_HTTPS);
-    HINTERNET hSession = WinHttpOpen(L"SLT/10.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    HINTERNET hSession = WinHttpOpen(L"SLT/10.1", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSession) return false;
     HINTERNET hConnect = WinHttpConnect(hSession, host, uc.nPort, 0);
     if (!hConnect) { WinHttpCloseHandle(hSession); return false; }
@@ -1826,7 +1826,7 @@ static void DrawMainTopBar() {
 
     ImGui::SetCursorPos(ImVec2(20, 12));
     if (g_font_title) ImGui::PushFont(g_font_title);
-    ImGui::TextColored(t.text, "SteamLuaTools 10.0");
+    ImGui::TextColored(t.text, "SteamLuaTools 10.1");
     if (g_font_title) ImGui::PopFont();
 
     if (!s_drag && in_drag && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
@@ -3059,7 +3059,7 @@ static std::atomic<bool> g_init_done{ false };
 
 static void BackgroundInitThread() {
     g_splash.step_text = "Загрузка настроек...";
-    LogPush("=== SteamLuaTools 10.0 запуск ===");
+    LogPush("=== SteamLuaTools 10.1 запуск ===");
     LogPush("Путь настроек: " + GetSettingsPath());
     LoadSettings();
     ApplyStyle();
@@ -3310,7 +3310,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR,
 
     HWND hwnd = ::CreateWindowExW(
         WS_EX_LAYERED,
-        wc.lpszClassName, L"SteamLuaTools 10.0",
+        wc.lpszClassName, L"SteamLuaTools 10.1",
         WS_POPUP | WS_MINIMIZEBOX, px, py, win_w, win_h,
         nullptr, nullptr, wc.hInstance, nullptr);
     g_hwnd = hwnd;
