@@ -1,5 +1,5 @@
 // ============================================================
-//  SteamLuaTools 10.1
+//  SteamLuaTools 10.2
 // ============================================================
 #pragma execution_character_set("utf-8")
 #pragma warning(disable: 4061)
@@ -143,272 +143,28 @@ static bool KillProcessByNameW(const wchar_t* exeName) {
 }
 
 // ============================================================
-//  Встроенный распаковщик ZIP (без сторонних библиотек)
-//  Минимальный inflate для метода Store и Deflate.
+//  Безопасная распаковка через системный tar.exe
 // ============================================================
-
-// --- CRC32 для проверки не нужен, но полезен при отладке ---
-// --- Читаем локальные заголовки и распаковываем каждый файл ---
-
-namespace zipmin {
-
-    struct Reader {
-        const unsigned char* data;
-        size_t size;
-        size_t pos;
-    };
-
-    static unsigned short read16(const unsigned char* p) { return (unsigned short)(p[0] | (p[1] << 8)); }
-    static unsigned int  read32(const unsigned char* p) { return (unsigned int)(p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24)); }
-
-    // ---------- Inflate (DEFLATE) ----------
-    struct BitReader {
-        const unsigned char* data;
-        size_t size;
-        size_t pos;
-        unsigned int bitBuf = 0;
-        int bitCnt = 0;
-        bool ok = true;
-
-        bool needBits(int n) {
-            while (bitCnt < n) {
-                if (pos >= size) { ok = false; return false; }
-                bitBuf |= (unsigned int)data[pos++] << bitCnt;
-                bitCnt += 8;
-            }
-            return true;
-        }
-        unsigned int getBits(int n) {
-            if (!needBits(n)) return 0;
-            unsigned int v = bitBuf & ((1u << n) - 1u);
-            bitBuf >>= n;
-            bitCnt -= n;
-            return v;
-        }
-        void alignByte() { bitBuf = 0; bitCnt = 0; }
-    };
-
-    struct Huff {
-        unsigned short counts[16] = { 0 };
-        unsigned short symbols[288] = { 0 };
-    };
-
-    static void buildHuff(Huff& h, const unsigned char* lengths, int n) {
-        for (int i = 0; i < 16; i++) h.counts[i] = 0;
-        for (int i = 0; i < n; i++) h.counts[lengths[i]]++;
-        h.counts[0] = 0;
-        unsigned short offs[16] = { 0 };
-        for (int i = 1; i < 16; i++) offs[i] = (unsigned short)(offs[i - 1] + h.counts[i - 1]);
-        for (int i = 0; i < n; i++) if (lengths[i]) h.symbols[offs[lengths[i]]++] = (unsigned short)i;
+static bool ExtractZipNative(const std::string& zipPath, const std::string& outDir) {
+    std::error_code ec;
+    fs::create_directories(outDir, ec);
+    std::wstring wZip = fs::absolute(zipPath).wstring();
+    std::wstring wOut = fs::absolute(outDir).wstring();
+    std::wstring cmd = L"tar.exe -xf \"" + wZip + L"\" -C \"" + wOut + L"\"";
+    STARTUPINFOW si = { sizeof(si) };
+    PROCESS_INFORMATION pi = { 0 };
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    if (CreateProcessW(nullptr, (wchar_t*)cmd.c_str(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        WaitForSingleObject(pi.hProcess, INFINITE);
+        DWORD exitCode = 0;
+        GetExitCodeProcess(pi.hProcess, &exitCode);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        return exitCode == 0;
     }
-
-    static int decodeSym(BitReader& br, const Huff& h) {
-        int code = 0, first = 0, index = 0;
-        for (int len = 1; len <= 15; len++) {
-            if (!br.needBits(1)) return -1;
-            code |= (int)br.getBits(1);
-            int count = h.counts[len];
-            if (code - count < first) return h.symbols[index + (code - first)];
-            index += count;
-            first = (first + count) << 1;
-            code <<= 1;
-        }
-        return -1;
-    }
-
-    static const int lengthBase[29] = { 3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258 };
-    static const int lengthExtra[29] = { 0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0 };
-    static const int distBase[30] = { 1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577 };
-    static const int distExtra[30] = { 0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13 };
-
-    static bool inflateBlock(BitReader& br, std::vector<unsigned char>& out) {
-        int bfinal = (int)br.getBits(1);
-        int btype = (int)br.getBits(2);
-        if (!br.ok) return false;
-
-        if (btype == 0) {
-            br.alignByte();
-            if (br.pos + 4 > br.size) return false;
-            unsigned short len = read16(br.data + br.pos); br.pos += 2;
-            unsigned short nlen = read16(br.data + br.pos); br.pos += 2;
-            if ((len ^ 0xFFFF) != nlen) return false;
-            if (br.pos + len > br.size) return false;
-            out.insert(out.end(), br.data + br.pos, br.data + br.pos + len);
-            br.pos += len;
-        }
-        else if (btype == 1 || btype == 2) {
-            Huff litLen, distH;
-            if (btype == 1) {
-                unsigned char litLenLen[288];
-                for (int i = 0; i < 144; i++) litLenLen[i] = 8;
-                for (int i = 144; i < 256; i++) litLenLen[i] = 9;
-                for (int i = 256; i < 280; i++) litLenLen[i] = 7;
-                for (int i = 280; i < 288; i++) litLenLen[i] = 8;
-                buildHuff(litLen, litLenLen, 288);
-                for (int i = 0; i < 30; i++) distH.counts[i] = 0;
-                distH.counts[5] = 30;
-                for (int i = 0; i < 30; i++) distH.symbols[i] = (unsigned short)i;
-            }
-            else {
-                int hlit = (int)br.getBits(5) + 257;
-                int hdist = (int)br.getBits(5) + 1;
-                int hclen = (int)br.getBits(4) + 4;
-                if (!br.ok) return false;
-                static const int order[19] = { 16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15 };
-                unsigned char clLens[19] = { 0 };
-                for (int i = 0; i < hclen; i++) clLens[order[i]] = (unsigned char)br.getBits(3);
-                if (!br.ok) return false;
-                Huff clH;
-                buildHuff(clH, clLens, 19);
-
-                unsigned char lens[320] = { 0 };
-                int n = 0;
-                while (n < hlit + hdist) {
-                    int sym = decodeSym(br, clH);
-                    if (sym < 0) return false;
-                    if (sym < 16) lens[n++] = (unsigned char)sym;
-                    else if (sym == 16) {
-                        if (n == 0) return false;
-                        unsigned char prev = lens[n - 1];
-                        int rep = 3 + (int)br.getBits(2);
-                        while (rep-- && n < hlit + hdist) lens[n++] = prev;
-                    }
-                    else if (sym == 17) {
-                        int rep = 3 + (int)br.getBits(3);
-                        while (rep-- && n < hlit + hdist) lens[n++] = 0;
-                    }
-                    else if (sym == 18) {
-                        int rep = 11 + (int)br.getBits(7);
-                        while (rep-- && n < hlit + hdist) lens[n++] = 0;
-                    }
-                }
-                if (!br.ok) return false;
-                buildHuff(litLen, lens, hlit);
-                buildHuff(distH, lens + hlit, hdist);
-            }
-
-            // decode
-            while (true) {
-                int sym = decodeSym(br, litLen);
-                if (sym < 0) return false;
-                if (sym < 256) {
-                    out.push_back((unsigned char)sym);
-                }
-                else if (sym == 256) {
-                    break;
-                }
-                else {
-                    int li = sym - 257;
-                    if (li < 0 || li >= 29) return false;
-                    int len = lengthBase[li] + (int)br.getBits(lengthExtra[li]);
-                    int ds = decodeSym(br, distH);
-                    if (ds < 0 || ds >= 30) return false;
-                    int dist = distBase[ds] + (int)br.getBits(distExtra[ds]);
-                    if ((size_t)dist > out.size()) return false;
-                    size_t start = out.size() - dist;
-                    for (int i = 0; i < len; i++) out.push_back(out[start + i]);
-                }
-            }
-        }
-        else {
-            return false;
-        }
-
-        return !bfinal ? inflateBlock(br, out) : true;
-    }
-
-    static bool inflateRaw(const unsigned char* data, size_t size, std::vector<unsigned char>& out) {
-        BitReader br; br.data = data; br.size = size; br.pos = 0;
-        out.clear();
-        return inflateBlock(br, out);
-    }
-
-    // ---------- ZIP контейнер ----------
-    static bool ExtractAll(const std::string& zipPath, const std::string& outDir) {
-        std::ifstream f(zipPath, std::ios::binary);
-        if (!f) return false;
-        std::vector<unsigned char> buf((std::istreambuf_iterator<char>(f)),
-            std::istreambuf_iterator<char>());
-        if (buf.empty()) return false;
-
-        // найти End Of Central Directory (EOCD) с конца
-        size_t eocd = std::string::npos;
-        for (size_t i = buf.size(); i >= 22 && i >= buf.size() - 65557; i--) {
-            size_t off = i - 22;
-            if (buf[off] == 0x50 && buf[off + 1] == 0x4B && buf[off + 2] == 0x05 && buf[off + 3] == 0x06) {
-                eocd = off; break;
-            }
-            if (off == 0) break;
-        }
-        if (eocd == std::string::npos) return false;
-
-        unsigned int centralOffset = read32(&buf[eocd + 16]);
-        unsigned int totalEntries = read16(&buf[eocd + 10]);
-        unsigned int centralSize = read32(&buf[eocd + 12]);
-        (void)centralSize;
-
-        std::error_code ec;
-        fs::create_directories(outDir, ec);
-
-        size_t pos = centralOffset;
-        for (unsigned int e = 0; e < totalEntries; e++) {
-            if (pos + 46 > buf.size()) break;
-            if (buf[pos] != 0x50 || buf[pos + 1] != 0x4B || buf[pos + 2] != 0x01 || buf[pos + 3] != 0x02) break;
-
-            unsigned short method = read16(&buf[pos + 10]);
-            unsigned int compSize = read32(&buf[pos + 20]);
-            unsigned int uncompSize = read32(&buf[pos + 24]);
-            unsigned short nameLen = read16(&buf[pos + 28]);
-            unsigned short extraLen = read16(&buf[pos + 30]);
-            unsigned short commentLen = read16(&buf[pos + 32]);
-            unsigned int localOffset = read32(&buf[pos + 42]);
-            (void)uncompSize;
-
-            if (pos + 46 + nameLen > buf.size()) break;
-            std::string name((const char*)&buf[pos + 46], nameLen);
-            pos += 46 + nameLen + extraLen + commentLen;
-
-            // локальный заголовок
-            if (localOffset + 30 > buf.size()) continue;
-            if (buf[localOffset] != 0x50 || buf[localOffset + 1] != 0x4B ||
-                buf[localOffset + 2] != 0x03 || buf[localOffset + 3] != 0x04) continue;
-            unsigned short lnameLen = read16(&buf[localOffset + 26]);
-            unsigned short lextraLen = read16(&buf[localOffset + 28]);
-            size_t dataStart = localOffset + 30 + lnameLen + lextraLen;
-            if (dataStart + compSize > buf.size()) continue;
-
-            // заменить '/' на системный разделитель
-            std::string n = name;
-            for (auto& c : n) if (c == '\\') c = '/';
-
-            // пропускаем директории
-            if (!n.empty() && n.back() == '/') continue;
-
-            fs::path outPath = fs::path(outDir) / n;
-            fs::create_directories(outPath.parent_path(), ec);
-
-            if (method == 0) {
-                // stored
-                std::ofstream of(outPath, std::ios::binary);
-                if (of) of.write((const char*)&buf[dataStart], compSize);
-            }
-            else if (method == 8) {
-                // deflate
-                std::vector<unsigned char> out;
-                if (inflateRaw(&buf[dataStart], compSize, out)) {
-                    std::ofstream of(outPath, std::ios::binary);
-                    if (of) of.write((const char*)out.data(), out.size());
-                }
-            }
-            else {
-                // unsupported method
-                continue;
-            }
-        }
-        return true;
-    }
-
-} // namespace zipmin
+    return false;
+}
 
 // ============================================================
 //  Шрифты
@@ -655,7 +411,7 @@ static bool HttpGetBinary(const std::string& url, std::vector<unsigned char>& ou
     uc.lpszUrlPath = path; uc.dwUrlPathLength = 2047;
     if (!WinHttpCrackUrl(wurl.c_str(), 0, 0, &uc)) return false;
     bool https = (uc.nScheme == INTERNET_SCHEME_HTTPS);
-    HINTERNET hSession = WinHttpOpen(L"SLT/10.1", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    HINTERNET hSession = WinHttpOpen(L"SLT/10.2", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSession) return false;
     HINTERNET hConnect = WinHttpConnect(hSession, host, uc.nPort, 0);
     if (!hConnect) { WinHttpCloseHandle(hSession); return false; }
@@ -1052,9 +808,26 @@ static bool LoadGamesJson() {
 static void DownloadAndDecodeWorker(std::string url, std::string appid) {
     std::vector<unsigned char> raw;
     if (HttpGetBinary(url, raw)) {
-        int w, h, comp;
-        unsigned char* pixels = stbi_load_from_memory(raw.data(), (int)raw.size(), &w, &h, &comp, 4);
+        if (raw.size() < 8 || raw.size() > 20 * 1024 * 1024) {
+            g_app.active_downloads--;
+            return;
+        }
+
+        int w = 0, h = 0, comp = 0;
+        unsigned char* pixels = nullptr;
+        try {
+            pixels = stbi_load_from_memory(raw.data(), (int)raw.size(), &w, &h, &comp, 4);
+        }
+        catch (...) {
+            pixels = nullptr;
+        }
+
         if (pixels) {
+            if (w <= 0 || h <= 0 || (size_t)w * h > 4096 * 4096) {
+                stbi_image_free(pixels);
+                g_app.active_downloads--;
+                return;
+            }
             PendingTexture pt;
             pt.appid = appid; pt.w = w; pt.h = h;
             pt.pixels.assign(pixels, pixels + (size_t)w * h * 4);
@@ -1068,11 +841,12 @@ static void DownloadAndDecodeWorker(std::string url, std::string appid) {
 static void RequestImageLoad(GameEntry& g) {
     if (g.texture || g.loading || g.load_failed) return;
     if (g.header_image.empty()) return;
-    if (g_app.active_downloads.load() >= 12) return;
+    if (g_app.active_downloads.load() >= 32) return;
     g.loading = true; g_app.active_downloads++;
     std::thread(DownloadAndDecodeWorker, g.header_image, g.appid).detach();
 }
 static void ProcessPendingTextures() {
+    if (!g_pd3dDevice || !g_pd3dDeviceContext) return;
     int done = 0;
     while (done < 8) {
         PendingTexture pt;
@@ -1081,6 +855,7 @@ static void ProcessPendingTextures() {
             pt = std::move(g_app.pending_textures.front()); g_app.pending_textures.pop_front();
         }
         if (pt.pixels.empty()) { done++; continue; }
+        if (pt.w <= 0 || pt.h <= 0 || pt.pixels.empty()) { done++; continue; }
         D3D11_TEXTURE2D_DESC desc = {};
         desc.Width = pt.w; desc.Height = pt.h; desc.MipLevels = 1; desc.ArraySize = 1;
         desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; desc.SampleDesc.Count = 1;
@@ -1089,7 +864,7 @@ static void ProcessPendingTextures() {
         ID3D11Texture2D* tex = nullptr;
         if (SUCCEEDED(g_pd3dDevice->CreateTexture2D(&desc, &sub, &tex))) {
             ID3D11ShaderResourceView* srv = nullptr;
-            if (SUCCEEDED(g_pd3dDevice->CreateShaderResourceView(tex, nullptr, &srv))) {
+            if (tex && SUCCEEDED(g_pd3dDevice->CreateShaderResourceView(tex, nullptr, &srv))) {
                 for (auto& g : g_app.all_games) if (g.appid == pt.appid) {
                     g.texture = srv; g.open_time = (float)ImGui::GetTime(); g.loading = false; break;
                 }
@@ -1185,9 +960,12 @@ static int CopyLuaFromDir(const std::string& extract_dir) {
         auto ext = p.path().extension().string();
         if (ext == ".lua" || ext == ".manifest") {
             std::error_code ec;
-            fs::copy_file(p.path(), lua_dst / p.path().filename(), fs::copy_options::overwrite_existing, ec);
+            if (fs::file_size(p.path(), ec) > 5 * 1024 * 1024) continue;
+            try { fs::copy_file(p.path(), lua_dst / p.path().filename(), fs::copy_options::overwrite_existing, ec); }
+            catch (...) { continue; }
             if (ec) LogPush("Не удалось скопировать " + p.path().string() + " -> lua: " + ec.message(), true);
-            fs::copy_file(p.path(), depot_dst / p.path().filename(), fs::copy_options::overwrite_existing, ec);
+            try { fs::copy_file(p.path(), depot_dst / p.path().filename(), fs::copy_options::overwrite_existing, ec); }
+            catch (...) { continue; }
             if (ec) LogPush("Не удалось скопировать " + p.path().string() + " -> depotcache: " + ec.message(), true);
             LogPush("Скопирован файл: " + p.path().filename().string());
             copied++;
@@ -1245,9 +1023,9 @@ static void DownloadManifestAsync(std::string appid, std::string name) {
         LogPush("Скачано: " + name + ", распаковка...");
 
         std::error_code ec; fs::remove_all(extract_dir, ec);
-        // встроенный распаковщик без PowerShell
-        bool unzip_ok = zipmin::ExtractAll(zip_path, extract_dir);
-        if (!unzip_ok) LogPush("Встроенный распаковщик не смог распаковать ZIP", true);
+
+        bool unzip_ok = ExtractZipNative(zip_path, extract_dir);
+        if (!unzip_ok) LogPush("tar.exe не смог распаковать ZIP", true);
 
         if (g_app.cancel_requested) {
             cleanup_partial(); LogPush("Загрузка отменена: " + name, true);
@@ -1309,8 +1087,8 @@ static void InstallZipFile(const std::string& zip_path) {
     std::string extract_dir = std::string(temp_path) + "SLT_manual";
     LogPush("Временная папка: " + extract_dir);
     std::error_code ec; fs::remove_all(extract_dir, ec);
-    bool unzip_ok = zipmin::ExtractAll(zip_path, extract_dir);
-    if (!unzip_ok) LogPush("Встроенный распаковщик не смог распаковать ZIP", true);
+    bool unzip_ok = ExtractZipNative(zip_path, extract_dir);
+    if (!unzip_ok) LogPush("tar.exe не смог распаковать ZIP", true);
     int copied = CopyLuaFromDir(extract_dir);
     LogPush("Из ZIP скопировано файлов: " + std::to_string(copied));
     if (copied == 0) LogPush("В ZIP не найдено ни одного .lua или .manifest!", true);
@@ -1350,8 +1128,8 @@ static void InstallOpenSteamToolsAsync() {
         g_app.progress_target = 0.20f; CloseSteam();
         g_app.progress_target = 0.45f;
         std::error_code ec; fs::remove_all(extract_dir, ec);
-        bool unzip_ok = zipmin::ExtractAll(fs::absolute(zip).string(), extract_dir);
-        if (!unzip_ok) LogPush("Встроенный распаковщик не смог распаковать OpenSteamTools.zip", true);
+        bool unzip_ok = ExtractZipNative(fs::absolute(zip).string(), extract_dir);
+        if (!unzip_ok) LogPush("tar.exe не смог распаковать OpenSteamTools.zip", true);
         g_app.progress_target = 0.70f;
         int copied = 0;
         LogPush("Копирование OpenSteamTools в: " + g_app_steam_path);
@@ -1826,7 +1604,7 @@ static void DrawMainTopBar() {
 
     ImGui::SetCursorPos(ImVec2(20, 12));
     if (g_font_title) ImGui::PushFont(g_font_title);
-    ImGui::TextColored(t.text, "SteamLuaTools 10.1");
+    ImGui::TextColored(t.text, "SteamLuaTools 10.2");
     if (g_font_title) ImGui::PopFont();
 
     if (!s_drag && in_drag && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
@@ -2155,6 +1933,40 @@ static void DrawShopPage() {
     ImGui::EndGroup();
 
     float content_right = ImGui::GetWindowContentRegionMax().x - 24.0f;
+    float btn_w = 110.0f;
+    ImGui::SameLine();
+    ImGui::SetCursorPosX(content_right - combo_w - btn_w - 10.0f);
+
+    // Кнопка "Обновить"
+    {
+        ImVec2 p0 = ImGui::GetCursorScreenPos();
+        ImVec2 p1 = ImVec2(p0.x + btn_w, p0.y + combo_h);
+        bool hov = ImGui::IsMouseHoveringRect(p0, p1);
+        ImDrawList* dl2 = ImGui::GetWindowDrawList();
+
+        ImU32 bg = ColF(t.accent, hov ? 0.35f : 0.15f);
+        dl2->AddRectFilled(p0, p1, bg);
+        dl2->AddRect(p0, p1, ColF(t.accent, hov ? 1.0f : 0.5f), 0.0f, 0, 1.5f);
+
+        const char* lbl = "Обновить";
+        ImVec2 ts = ImGui::CalcTextSize(lbl);
+        dl2->AddText(ImVec2(p0.x + (btn_w - ts.x) * 0.5f, p0.y + (combo_h - ts.y) * 0.5f), ColF(t.text, 1.0f), lbl);
+
+        if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            int start = g_app.page * AppState::kGamesPerPage;
+            int end = std::min((int)g_app.filtered.size(), start + AppState::kGamesPerPage);
+            for (int i = start; i < end; i++) {
+                GameEntry& ge = g_app.all_games[g_app.filtered[i]];
+                if (ge.texture) { ge.texture->Release(); ge.texture = nullptr; }
+                ge.loading = false;
+                ge.load_failed = false;
+                ge.open_time = -1.0f;
+                ge.fade_in = 0.0f;
+            }
+            LogPush("Обновление картинок страницы " + std::to_string(g_app.page + 1));
+        }
+    }
+
     ImGui::SameLine();
     ImGui::SetCursorPosX(content_right - combo_w);
     DrawTagComboBox(combo_w, combo_h);
@@ -3058,45 +2870,51 @@ static void DrawUI() {
 static std::atomic<bool> g_init_done{ false };
 
 static void BackgroundInitThread() {
-    g_splash.step_text = "Загрузка настроек...";
-    LogPush("=== SteamLuaTools 10.1 запуск ===");
-    LogPush("Путь настроек: " + GetSettingsPath());
-    LoadSettings();
-    ApplyStyle();
-    LogPush("Настройки загружены. Тема: " + std::to_string((int)g_theme) + ", FX: " + std::to_string((int)g_fx));
+    try {
+        g_splash.step_text = "Загрузка настроек...";
+        LogPush("=== SteamLuaTools 10.2 запуск ===");
+        LogPush("Путь настроек: " + GetSettingsPath());
+        LoadSettings();
+        ApplyStyle();
+        LogPush("Настройки загружены. Тема: " + std::to_string((int)g_theme) + ", FX: " + std::to_string((int)g_fx));
 
-    g_splash.step_text = "Поиск Steam...";
-    LogPush("Поиск Steam...");
-    g_app_steam_path = FindSteamPath();
-    g_app.steam_found = !g_app_steam_path.empty();
-    if (g_app.steam_found) {
-        LogPush("Steam найден: " + g_app_steam_path);
-        LogPush("Папка Lua: " + (fs::path(g_app_steam_path) / "config" / "lua").string());
-        LogPush("Папка Depotcache: " + (fs::path(g_app_steam_path) / "depotcache").string());
+        g_splash.step_text = "Поиск Steam...";
+        LogPush("Поиск Steam...");
+        g_app_steam_path = FindSteamPath();
+        g_app.steam_found = !g_app_steam_path.empty();
+        if (g_app.steam_found) {
+            LogPush("Steam найден: " + g_app_steam_path);
+            LogPush("Папка Lua: " + (fs::path(g_app_steam_path) / "config" / "lua").string());
+            LogPush("Папка Depotcache: " + (fs::path(g_app_steam_path) / "depotcache").string());
+        }
+        else LogPush("Steam не найден в системе", true);
+
+        g_splash.step_text = "Загрузка базы игр...";
+        LogPush("Загрузка базы игр gamespic.json...");
+        if (LoadGamesJson()) {
+            LogPush("Загружено игр: " + std::to_string(g_app.all_games.size()));
+            LogPush("Доступно тегов: " + std::to_string((int)g_app.available_tags.size()));
+        }
+        else {
+            LogPush("Не удалось загрузить базу игр gamespic.json", true);
+        }
+
+        LoadSettings();
+        RefreshInstalledFlags();
+        RefreshInstalledFiles();
+        LogPush("Установленных игр (lua-файлов): " + std::to_string(g_app.installed.size()));
+
+        RebuildFiltered();
+        LogPush("Отфильтровано записей: " + std::to_string(g_app.filtered.size()));
+
+        g_splash.step_text = "Готово";
+        LogPush("=== Инициализация завершена ===");
+        g_init_done = true;
     }
-    else LogPush("Steam не найден в системе", true);
-
-    g_splash.step_text = "Загрузка базы игр...";
-    LogPush("Загрузка базы игр gamespic.json...");
-    if (LoadGamesJson()) {
-        LogPush("Загружено игр: " + std::to_string(g_app.all_games.size()));
-        LogPush("Доступно тегов: " + std::to_string((int)g_app.available_tags.size()));
+    catch (...) {
+        LogPush("INIT CRASH", true);
+        g_init_done = true;
     }
-    else {
-        LogPush("Не удалось загрузить базу игр gamespic.json", true);
-    }
-
-    LoadSettings();
-    RefreshInstalledFlags();
-    RefreshInstalledFiles();
-    LogPush("Установленных игр (lua-файлов): " + std::to_string(g_app.installed.size()));
-
-    RebuildFiltered();
-    LogPush("Отфильтровано записей: " + std::to_string(g_app.filtered.size()));
-
-    g_splash.step_text = "Готово";
-    LogPush("=== Инициализация завершена ===");
-    g_init_done = true;
 }
 
 // ============================================================
@@ -3310,7 +3128,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR,
 
     HWND hwnd = ::CreateWindowExW(
         WS_EX_LAYERED,
-        wc.lpszClassName, L"SteamLuaTools 10.1",
+        wc.lpszClassName, L"SteamLuaTools 10.2",
         WS_POPUP | WS_MINIMIZEBOX, px, py, win_w, win_h,
         nullptr, nullptr, wc.hInstance, nullptr);
     g_hwnd = hwnd;
